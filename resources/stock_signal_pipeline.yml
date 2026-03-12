@@ -1,0 +1,39 @@
+# =============================================================================
+# Resource: Scheduled Spark Streaming Pipeline Job
+# Included by databricks.yml via `include: [resources/*.yml]`
+# All paths are relative to the bundle root (location of databricks.yml).
+# =============================================================================
+
+resources:
+  jobs:
+    stock_signal_pipeline:
+      name: "stock-signal-pipeline-${bundle.target}"
+      description: >
+        Ingest Yahoo Finance data and run the streaming
+        indicator / signal pipeline.
+
+      schedule:
+        quartz_cron_expression: "0 0/30 14-21 ? * MON-FRI"
+        timezone_id: "America/New_York"
+
+      tasks:
+        - task_key: run_full_pipeline
+          notebook_task:
+            notebook_path: ./src/notebooks/live_stock_signal_dashboard
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema:  "${var.schema}"
+          environment_key: default
+
+      environments:
+        - environment_key: default
+          spec:
+            client: "1"
+
+      email_notifications:
+        on_failure:
+          - "${workspace.current_user.userName}"
+
+      tags:
+        project: stock-signal-dashboard
+        team:    data-engineering

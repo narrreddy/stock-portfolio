@@ -1,0 +1,56 @@
+# =============================================================================
+# Databricks Asset Bundle: Live Stock Signal Dashboard
+# Docs: https://learn.microsoft.com/en-us/azure/databricks/dev-tools/bundles/
+#
+# Project layout (relative to this file — the bundle root):
+#   resources/       → Resource definitions (jobs, apps) included below
+#   src/notebooks/   → Pipeline notebook source
+#   src/pipelines/   → Spark declarative / DLT pipelines (future)
+#   src/dashboards/  → AI/BI dashboard definitions (future)
+#   app/             → Streamlit app source (deployed via Databricks Apps)
+# =============================================================================
+
+bundle:
+  name: stock_signal_dashboard
+
+include:
+  - resources/*.yml
+
+variables:
+  warehouse_id:
+    description: "Databricks SQL Warehouse ID for the Streamlit app"
+  catalog:
+    description: "Unity Catalog catalog name"
+    default: "stockapp"
+  schema:
+    description: "Unity Catalog schema name"
+    default: "production"
+
+# ---------------------------------------------------------------------------
+# Targets
+#
+# Workspace host is resolved from the DATABRICKS_HOST environment variable
+# (set in GitHub Actions secrets or via `databricks auth login`).
+# ---------------------------------------------------------------------------
+targets:
+  dev:
+    mode: development
+    default: true
+    variables:
+      catalog: stockapp_dev
+
+  staging:
+    variables:
+      catalog: stockapp_staging
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: stockapp
+    permissions:
+      - user_name: ${workspace.current_user.userName}
+        level: CAN_MANAGE
+    run_as:
+      user_name: ${workspace.current_user.userName}

@@ -1,0 +1,24 @@
+# Databricks App Runtime Configuration
+# Docs: https://learn.microsoft.com/en-us/azure/databricks/dev-tools/databricks-apps/app-runtime/
+
+command:
+  - "streamlit"
+  - "run"
+  - "streamlit_app.py"
+  - "--server.port"
+  - "8501"
+  - "--server.headless"
+  - "true"
+
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: warehouse-id
+
+  - name: STREAMLIT_GATHER_USAGE_STATS
+    value: "false"
+
+  - name: STOCK_CATALOG
+    value: "stockapp"
+
+  - name: STOCK_SCHEMA
+    value: "production"

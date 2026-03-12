@@ -1,0 +1,136 @@
+# =============================================================================
+# GitHub Actions CI/CD for Databricks Asset Bundles
+#
+# Required GitHub Secrets:
+#   DATABRICKS_TOKEN        - Service principal access token
+#   DATABRICKS_HOST         - Workspace URL  (https://<ws>.azuredatabricks.net)
+#   DATABRICKS_WAREHOUSE_ID - SQL warehouse ID for the Streamlit app
+# =============================================================================
+
+name: Deploy Stock Signal Dashboard
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - "databricks.yml"
+      - "resources/**"
+      - "src/**"
+      - "app/**"
+      - ".github/workflows/deploy.yml"
+
+  push:
+    branches: [main, dev]
+    paths:
+      - "databricks.yml"
+      - "resources/**"
+      - "src/**"
+      - "app/**"
+      - ".github/workflows/deploy.yml"
+
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Bundle target (dev / staging / prod)"
+        required: true
+        default: dev
+        type: choice
+        options: [dev, staging, prod]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+
+  # === 1. VALIDATE (every PR and push) ====================================
+  validate:
+    name: Validate Bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+
+      - name: Validate bundle
+        run: databricks bundle validate
+        env:
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
+
+  # === 2. DEPLOY DEV (push to dev branch) =================================
+  deploy-dev:
+    name: Deploy to Dev
+    needs: validate
+    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+
+      - name: Deploy bundle
+        run: databricks bundle deploy -t dev
+        env:
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+
+      - name: Start app
+        run: databricks bundle run stock_signal_app -t dev
+        env:
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
+
+  # === 3. DEPLOY PROD (push to main branch) ===============================
+  deploy-prod:
+    name: Deploy to Production
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+
+      - name: Deploy bundle
+        run: databricks bundle deploy -t prod
+        env:
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+
+      - name: Start app
+        run: databricks bundle run stock_signal_app -t prod
+        env:
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
+
+      - name: Trigger pipeline job
+        run: databricks bundle run stock_signal_pipeline -t prod
+        env:
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
+
+  # === 4. MANUAL DEPLOY (workflow_dispatch) ================================
+  deploy-manual:
+    name: "Manual Deploy (${{ inputs.target }})"
+    needs: validate
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+
+      - name: Deploy bundle
+        run: databricks bundle deploy -t ${{ inputs.target }}
+        env:
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+
+      - name: Start app
+        run: databricks bundle run stock_signal_app -t ${{ inputs.target }}
+        env:
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
