@@ -1,7 +1,7 @@
 # =============================================================================
 # Resource: Scheduled Spark Streaming Pipeline Job
 # Included by databricks.yml via `include: [resources/*.yml]`
-# All paths are relative to the bundle root (location of databricks.yml).
+# All paths are relative to THIS file's location (resources/).
 # =============================================================================
 
 resources:
@@ -19,7 +19,7 @@ resources:
       tasks:
         - task_key: run_full_pipeline
           notebook_task:
-            notebook_path: ./src/notebooks/live_stock_signal_dashboard
+            notebook_path: ../src/notebooks/live_stock_signal_dashboard.py
             base_parameters:
               catalog: "${var.catalog}"
               schema:  "${var.schema}"

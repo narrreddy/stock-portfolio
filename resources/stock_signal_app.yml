@@ -1,7 +1,7 @@
 # =============================================================================
 # Resource: Streamlit Databricks App
 # Included by databricks.yml via `include: [resources/*.yml]`
-# All paths are relative to the bundle root (location of databricks.yml).
+# All paths are relative to THIS file's location (resources/).
 # =============================================================================
 
 resources:
@@ -11,7 +11,7 @@ resources:
       description: >
         Live Stock Signal Dashboard — candlestick charts, technical
         indicators, BUY signals, and portfolio tracking.
-      source_code_path: ./app
+      source_code_path: ../app
 
       config:
         command:
