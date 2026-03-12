@@ -55,7 +55,7 @@ jobs:
         env:
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+          BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
 
   # === 2. DEPLOY DEV (push to dev branch) =================================
   deploy-dev:
@@ -73,7 +73,7 @@ jobs:
         env:
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+          BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
 
       - name: Start app
         run: databricks bundle run stock_signal_app -t dev
@@ -97,7 +97,7 @@ jobs:
         env:
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+          BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
 
       - name: Start app
         run: databricks bundle run stock_signal_app -t prod
@@ -127,7 +127,7 @@ jobs:
         env:
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+          BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
 
       - name: Start app
         run: databricks bundle run stock_signal_app -t ${{ inputs.target }}

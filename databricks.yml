@@ -19,6 +19,7 @@ include:
 variables:
   warehouse_id:
     description: "Databricks SQL Warehouse ID for the Streamlit app"
+    default: ""
   catalog:
     description: "Unity Catalog catalog name"
     default: "stockapp"
