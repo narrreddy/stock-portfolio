@@ -20,10 +20,10 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from databricks import sql as dbsql
-from databricks.sdk.core import Config
+from databricks.sdk import WorkspaceClient
 
-# ── Databricks SDK Config (auto-detects HOST, CLIENT_ID, CLIENT_SECRET) ──
-cfg = Config()
+# ── Databricks SDK client (auto-detects HOST, CLIENT_ID, CLIENT_SECRET) ──
+w = WorkspaceClient()
 
 # ── Table Configuration ────────────────────────────────────────────────────
 CATALOG = os.getenv("STOCK_CATALOG", "stockapp")
@@ -35,8 +35,8 @@ GOLD_PORT = f"{CATALOG}.{SCHEMA}.portfolio_state"
 
 
 def _get_server_hostname() -> str:
-    """Strip protocol from cfg.host — SQL connector needs bare hostname."""
-    host = cfg.host or ""
+    """Strip protocol from host — SQL connector needs bare hostname."""
+    host = w.config.host or ""
     return host.replace("https://", "").replace("http://", "").rstrip("/")
 
 
@@ -45,16 +45,25 @@ def _get_http_path() -> str:
     return f"/sql/1.0/warehouses/{wid}"
 
 
-@st.cache_resource
+def _get_access_token() -> str:
+    """Get OAuth access token via SDK (service principal M2M)."""
+    header_factory = w.config.authenticate
+    headers = header_factory()
+    auth_value = headers.get("Authorization", "")
+    return auth_value.replace("Bearer ", "")
+
+
+@st.cache_resource(ttl=2400)  # refresh every 40 min (tokens last ~60 min)
 def get_connection():
-    """Connect to SQL warehouse using OAuth (Databricks Apps service principal)."""
+    """Connect to SQL warehouse using explicit OAuth token."""
     hostname = _get_server_hostname()
     http_path = _get_http_path()
+    token = _get_access_token()
     try:
         conn = dbsql.connect(
             server_hostname=hostname,
             http_path=http_path,
-            credentials_provider=lambda: cfg.authenticate,
+            access_token=token,
         )
         return conn
     except Exception as e:
@@ -62,10 +71,9 @@ def get_connection():
             f"**SQL Connection Failed**\n\n"
             f"- `server_hostname`: `{hostname}`\n"
             f"- `http_path`: `{http_path}`\n"
+            f"- `token`: `{'set (length=' + str(len(token)) + ')' if token else '(empty)'}`\n"
             f"- `DATABRICKS_HOST` env: `{os.getenv('DATABRICKS_HOST', '(not set)')}`\n"
-            f"- `DATABRICKS_WAREHOUSE_ID` env: `{os.getenv('DATABRICKS_WAREHOUSE_ID', '(not set)')}`\n"
-            f"- `DATABRICKS_CLIENT_ID` env: `{'set (' + os.getenv('DATABRICKS_CLIENT_ID', '')[:8] + '...)' if os.getenv('DATABRICKS_CLIENT_ID') else '(not set)'}`\n"
-            f"- `DATABRICKS_CLIENT_SECRET` env: `{'set (length=' + str(len(os.getenv('DATABRICKS_CLIENT_SECRET', ''))) + ')' if os.getenv('DATABRICKS_CLIENT_SECRET') else '(not set)'}`\n\n"
+            f"- `DATABRICKS_WAREHOUSE_ID` env: `{os.getenv('DATABRICKS_WAREHOUSE_ID', '(not set)')}`\n\n"
             f"**Error**: `{type(e).__name__}: {e}`"
         )
         st.stop()
