@@ -1,5 +1,8 @@
 # Databricks App Runtime Configuration
 # Docs: https://learn.microsoft.com/en-us/azure/databricks/dev-tools/databricks-apps/app-runtime/
+#
+# Environment variables are configured in resources/stock_signal_app.yml
+# (injected by DABs at deploy time). Do NOT duplicate them here.
 
 command:
   - "streamlit"
@@ -9,16 +12,3 @@ command:
   - "8501"
   - "--server.headless"
   - "true"
-
-env:
-  - name: DATABRICKS_WAREHOUSE_ID
-    value: ""
-
-  - name: STREAMLIT_GATHER_USAGE_STATS
-    value: "false"
-
-  - name: STOCK_CATALOG
-    value: "stockapp"
-
-  - name: STOCK_SCHEMA
-    value: "production"
