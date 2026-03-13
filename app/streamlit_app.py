@@ -48,11 +48,27 @@ def _get_http_path() -> str:
 @st.cache_resource
 def get_connection():
     """Connect to SQL warehouse using OAuth (Databricks Apps service principal)."""
-    return dbsql.connect(
-        server_hostname=_get_server_hostname(),
-        http_path=_get_http_path(),
-        credentials_provider=lambda: cfg.authenticate,
-    )
+    hostname = _get_server_hostname()
+    http_path = _get_http_path()
+    try:
+        conn = dbsql.connect(
+            server_hostname=hostname,
+            http_path=http_path,
+            credentials_provider=lambda: cfg.authenticate,
+        )
+        return conn
+    except Exception as e:
+        st.error(
+            f"**SQL Connection Failed**\n\n"
+            f"- `server_hostname`: `{hostname}`\n"
+            f"- `http_path`: `{http_path}`\n"
+            f"- `DATABRICKS_HOST` env: `{os.getenv('DATABRICKS_HOST', '(not set)')}`\n"
+            f"- `DATABRICKS_WAREHOUSE_ID` env: `{os.getenv('DATABRICKS_WAREHOUSE_ID', '(not set)')}`\n"
+            f"- `DATABRICKS_CLIENT_ID` env: `{'set (' + os.getenv('DATABRICKS_CLIENT_ID', '')[:8] + '...)' if os.getenv('DATABRICKS_CLIENT_ID') else '(not set)'}`\n"
+            f"- `DATABRICKS_CLIENT_SECRET` env: `{'set (length=' + str(len(os.getenv('DATABRICKS_CLIENT_SECRET', ''))) + ')' if os.getenv('DATABRICKS_CLIENT_SECRET') else '(not set)'}`\n\n"
+            f"**Error**: `{type(e).__name__}: {e}`"
+        )
+        st.stop()
 
 
 def run_query(query: str) -> pd.DataFrame:
