@@ -16,6 +16,7 @@ Environment variables (set via DABs config in resources/stock_signal_app.yml):
 """
 
 import os
+import time
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -42,17 +43,21 @@ def run_query(query: str) -> pd.DataFrame:
         response = w.statement_execution.execute_statement(
             warehouse_id=WAREHOUSE_ID,
             statement=query,
-            wait_timeout="120s",
+            wait_timeout="50s",
         )
     except Exception as e:
         st.error(
             f"**Query execution error**\n\n"
             f"- `warehouse_id`: `{WAREHOUSE_ID}`\n"
-            f"- `DATABRICKS_HOST`: `{os.getenv('DATABRICKS_HOST', '(not set)')}`\n"
-            f"- `DATABRICKS_CLIENT_ID`: `{'set' if os.getenv('DATABRICKS_CLIENT_ID') else '(not set)'}`\n\n"
+            f"- `DATABRICKS_HOST`: `{os.getenv('DATABRICKS_HOST', '(not set)')}`\n\n"
             f"**Error**: `{type(e).__name__}: {e}`"
         )
         st.stop()
+
+    # Poll until the statement finishes (handles warehouse cold-start > 50s)
+    while response.status.state in (StatementState.PENDING, StatementState.RUNNING):
+        time.sleep(3)
+        response = w.statement_execution.get_statement(response.statement_id)
 
     if response.status.state != StatementState.SUCCEEDED:
         msg = response.status.error.message if response.status.error else "unknown"
