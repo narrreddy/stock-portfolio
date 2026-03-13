@@ -1,7 +1,8 @@
 """Live Stock Signal Dashboard — Streamlit UI for Databricks App.
 
-Reads from Delta tables in Unity Catalog via Databricks SQL connector.
-Displays candlestick charts, technical indicators, BUY signals, and portfolio.
+Reads from Delta tables in Unity Catalog via Databricks SDK Statement
+Execution API (REST).  Displays candlestick charts, technical indicators,
+BUY signals, and portfolio.
 
 Environment variables (auto-set by Databricks Apps runtime):
   DATABRICKS_HOST             - workspace URL
@@ -19,11 +20,12 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from databricks import sql as dbsql
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.sql import StatementState
 
 # ── Databricks SDK client (auto-detects HOST, CLIENT_ID, CLIENT_SECRET) ──
 w = WorkspaceClient()
+WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
 
 # ── Table Configuration ────────────────────────────────────────────────────
 CATALOG = os.getenv("STOCK_CATALOG", "stockapp")
@@ -34,58 +36,47 @@ GOLD_SIG = f"{CATALOG}.{SCHEMA}.trade_signals"
 GOLD_PORT = f"{CATALOG}.{SCHEMA}.portfolio_state"
 
 
-def _get_server_hostname() -> str:
-    """Strip protocol from host — SQL connector needs bare hostname."""
-    host = w.config.host or ""
-    return host.replace("https://", "").replace("http://", "").rstrip("/")
-
-
-def _get_http_path() -> str:
-    wid = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
-    return f"/sql/1.0/warehouses/{wid}"
-
-
-def _get_access_token() -> str:
-    """Get OAuth access token via SDK (service principal M2M)."""
-    header_factory = w.config.authenticate
-    headers = header_factory()
-    auth_value = headers.get("Authorization", "")
-    return auth_value.replace("Bearer ", "")
-
-
-@st.cache_resource(ttl=2400)  # refresh every 40 min (tokens last ~60 min)
-def get_connection():
-    """Connect to SQL warehouse using explicit OAuth token."""
-    hostname = _get_server_hostname()
-    http_path = _get_http_path()
-    token = _get_access_token()
+def run_query(query: str) -> pd.DataFrame:
+    """Execute SQL via Databricks REST API and return a typed DataFrame."""
     try:
-        conn = dbsql.connect(
-            server_hostname=hostname,
-            http_path=http_path,
-            access_token=token,
+        response = w.statement_execution.execute_statement(
+            warehouse_id=WAREHOUSE_ID,
+            statement=query,
+            wait_timeout="120s",
         )
-        return conn
     except Exception as e:
         st.error(
-            f"**SQL Connection Failed**\n\n"
-            f"- `server_hostname`: `{hostname}`\n"
-            f"- `http_path`: `{http_path}`\n"
-            f"- `token`: `{'set (length=' + str(len(token)) + ')' if token else '(empty)'}`\n"
-            f"- `DATABRICKS_HOST` env: `{os.getenv('DATABRICKS_HOST', '(not set)')}`\n"
-            f"- `DATABRICKS_WAREHOUSE_ID` env: `{os.getenv('DATABRICKS_WAREHOUSE_ID', '(not set)')}`\n\n"
+            f"**Query execution error**\n\n"
+            f"- `warehouse_id`: `{WAREHOUSE_ID}`\n"
+            f"- `DATABRICKS_HOST`: `{os.getenv('DATABRICKS_HOST', '(not set)')}`\n"
+            f"- `DATABRICKS_CLIENT_ID`: `{'set' if os.getenv('DATABRICKS_CLIENT_ID') else '(not set)'}`\n\n"
             f"**Error**: `{type(e).__name__}: {e}`"
         )
         st.stop()
 
+    if response.status.state != StatementState.SUCCEEDED:
+        msg = response.status.error.message if response.status.error else "unknown"
+        st.error(f"**Query failed** ({response.status.state}): {msg}")
+        st.stop()
 
-def run_query(query: str) -> pd.DataFrame:
-    """Execute SQL and return pandas DataFrame."""
-    conn = get_connection()
-    with conn.cursor() as cursor:
-        cursor.execute(query)
-        columns = [desc[0] for desc in cursor.description]
-        return pd.DataFrame(cursor.fetchall(), columns=columns)
+    # Build DataFrame from response
+    columns = [col.name for col in response.manifest.schema.columns]
+    rows = response.result.data_array if response.result and response.result.data_array else []
+    df = pd.DataFrame(rows, columns=columns)
+
+    # Cast columns to correct types based on manifest
+    for col_info in response.manifest.schema.columns:
+        name = col_info.name
+        type_text = (col_info.type_text or "").upper()
+        if name not in df.columns or df[name].empty:
+            continue
+        if any(t in type_text for t in ["DOUBLE", "FLOAT", "DECIMAL"]):
+            df[name] = pd.to_numeric(df[name], errors="coerce")
+        elif any(t in type_text for t in ["INT", "LONG", "SHORT", "BIGINT"]):
+            df[name] = pd.to_numeric(df[name], errors="coerce")
+        elif "TIMESTAMP" in type_text:
+            df[name] = pd.to_datetime(df[name], errors="coerce")
+    return df
 
 
 # ── Page Config ─────────────────────────────────────────────────────────
@@ -103,7 +94,6 @@ st.sidebar.markdown("- RSI < 70")
 st.sidebar.markdown("- Vortex+ > Vortex-")
 
 if st.sidebar.button("🔄 Refresh Data"):
-    st.cache_resource.clear()
     st.rerun()
 
 # ── Load Data ──────────────────────────────────────────────────────────
