@@ -3,12 +3,12 @@
 #
 # Environment variables are configured in resources/stock_signal_app.yml
 # (injected by DABs at deploy time). Do NOT duplicate them here.
+#
+# NOTE: Do NOT set --server.port or --server.headless here.
+# Databricks Apps auto-configures STREAMLIT_SERVER_PORT and
+# STREAMLIT_SERVER_HEADLESS. Overriding them causes port mismatch.
 
 command:
   - "streamlit"
   - "run"
   - "streamlit_app.py"
-  - "--server.port"
-  - "8501"
-  - "--server.headless"
-  - "true"

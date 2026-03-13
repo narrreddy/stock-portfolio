@@ -3,12 +3,13 @@
 Reads from Delta tables in Unity Catalog via Databricks SQL connector.
 Displays candlestick charts, technical indicators, BUY signals, and portfolio.
 
-Environment variables (set by Databricks Apps runtime or DABs config):
-  DATABRICKS_HOST             - workspace URL (auto-set by Databricks Apps)
-  DATABRICKS_CLIENT_ID        - service principal client ID (auto-set)
-  DATABRICKS_CLIENT_SECRET    - OAuth secret (auto-set)
-  DATABRICKS_HTTP_PATH        - SQL warehouse HTTP path (optional override)
-  DATABRICKS_WAREHOUSE_ID     - alternative to HTTP_PATH (auto-builds path)
+Environment variables (auto-set by Databricks Apps runtime):
+  DATABRICKS_HOST             - workspace URL
+  DATABRICKS_CLIENT_ID        - service principal client ID
+  DATABRICKS_CLIENT_SECRET    - OAuth secret
+
+Environment variables (set via DABs config in resources/stock_signal_app.yml):
+  DATABRICKS_WAREHOUSE_ID     - SQL warehouse ID
   STOCK_CATALOG               - Unity Catalog catalog (default: stockapp)
   STOCK_SCHEMA                - Unity Catalog schema  (default: production)
 """
@@ -19,20 +20,12 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from databricks import sql as dbsql
-from databricks.sdk.core import ApiClient, Config, HeaderFactory
+from databricks.sdk.core import Config
 
+# ── Databricks SDK Config (auto-detects HOST, CLIENT_ID, CLIENT_SECRET) ──
+cfg = Config()
 
-def credential_provider() -> HeaderFactory:
-    """Build OAuth credential provider for Databricks Apps service principal."""
-    config = Config(
-        host=os.getenv("DATABRICKS_HOST"),
-        client_id=os.getenv("DATABRICKS_CLIENT_ID"),
-        client_secret=os.getenv("DATABRICKS_CLIENT_SECRET"),
-    )
-    return config.authenticate
-
-
-# ── Configuration (from env vars or defaults) ────────────────────────────
+# ── Table Configuration ────────────────────────────────────────────────────
 CATALOG = os.getenv("STOCK_CATALOG", "stockapp")
 SCHEMA = os.getenv("STOCK_SCHEMA", "production")
 BRONZE = f"{CATALOG}.{SCHEMA}.raw_market_data"
@@ -41,29 +34,18 @@ GOLD_SIG = f"{CATALOG}.{SCHEMA}.trade_signals"
 GOLD_PORT = f"{CATALOG}.{SCHEMA}.portfolio_state"
 
 
-def _get_server_hostname() -> str:
-    """Extract bare hostname from DATABRICKS_HOST URL."""
-    host = os.getenv("DATABRICKS_HOST", "")
-    # Strip protocol prefix — SQL connector needs bare hostname
-    return host.replace("https://", "").replace("http://", "").rstrip("/")
-
-
 def _get_http_path() -> str:
-    """Build SQL warehouse HTTP path from env vars."""
-    explicit = os.getenv("DATABRICKS_HTTP_PATH")
-    if explicit:
-        return explicit
     wid = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
     return f"/sql/1.0/warehouses/{wid}"
 
 
 @st.cache_resource
 def get_connection():
-    """Establish Databricks SQL connection using OAuth (Databricks Apps)."""
+    """Connect to SQL warehouse using OAuth (Databricks Apps service principal)."""
     return dbsql.connect(
-        server_hostname=_get_server_hostname(),
+        server_hostname=cfg.host,
         http_path=_get_http_path(),
-        credentials_provider=credential_provider(),
+        credentials_provider=lambda: cfg.authenticate,
     )
 
 
@@ -76,11 +58,11 @@ def run_query(query: str) -> pd.DataFrame:
         return pd.DataFrame(cursor.fetchall(), columns=columns)
 
 
-# ── Page Config ───────────────────────────────────────────────────────────────
+# ── Page Config ─────────────────────────────────────────────────────────
 st.set_page_config(page_title="Stock Signal Dashboard", layout="wide")
 st.title("📈 Live Stock Signal Dashboard")
 
-# ── Sidebar: Ticker Selector ─────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────
 tickers_df = run_query(f"SELECT DISTINCT ticker FROM {BRONZE} ORDER BY ticker")
 available_tickers = tickers_df["ticker"].tolist() if not tickers_df.empty else []
 selected_ticker = st.sidebar.selectbox("Select Ticker", available_tickers, index=0)
@@ -94,7 +76,7 @@ if st.sidebar.button("🔄 Refresh Data"):
     st.cache_resource.clear()
     st.rerun()
 
-# ── Load Data ─────────────────────────────────────────────────────────────────
+# ── Load Data ──────────────────────────────────────────────────────────
 ohlc = run_query(f"""
     SELECT * FROM {BRONZE}
     WHERE ticker = '{selected_ticker}'
@@ -115,7 +97,7 @@ signals = run_query(f"""
 
 portfolio = run_query(f"SELECT * FROM {GOLD_PORT} ORDER BY ticker")
 
-# ── Main Chart: Candlestick + SMA + Signals ──────────────────────────────────
+# ── Main Chart ─────────────────────────────────────────────────────────
 if not ohlc.empty:
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True,
@@ -185,7 +167,7 @@ if not ohlc.empty:
 else:
     st.warning(f"No OHLC data for {selected_ticker}. Run the ingest pipeline first.")
 
-# ── Signals Table ─────────────────────────────────────────────────────────────
+# ── Signals Table ───────────────────────────────────────────────────────
 st.subheader(f"🚨 Recent BUY Signals — {selected_ticker}")
 if not signals.empty:
     st.dataframe(
@@ -196,7 +178,7 @@ if not signals.empty:
 else:
     st.info("No BUY signals generated for this ticker yet.")
 
-# ── Portfolio Dashboard ──────────────────────────────────────────────────────
+# ── Portfolio Dashboard ────────────────────────────────────────────────
 st.subheader("💼 Portfolio Dashboard")
 if not portfolio.empty:
     cols = st.columns(len(portfolio))
@@ -217,6 +199,6 @@ if not portfolio.empty:
 else:
     st.info("No portfolio data yet. BUY signals will create positions.")
 
-# ── Footer ────────────────────────────────────────────────────────────────────
+# ── Footer ──────────────────────────────────────────────────────────────
 st.sidebar.markdown("---")
 st.sidebar.caption("Powered by Databricks · Delta Lake · Spark Streaming")

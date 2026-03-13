@@ -18,10 +18,6 @@ resources:
           - streamlit
           - run
           - streamlit_app.py
-          - --server.port
-          - "8501"
-          - --server.headless
-          - "true"
         env:
           - name: DATABRICKS_WAREHOUSE_ID
             value: "${var.warehouse_id}"
