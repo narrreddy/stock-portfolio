@@ -40,6 +40,15 @@ on:
 permissions:
   contents: read
 
+# ---------------------------------------------------------------------------
+# Shared env vars for all jobs. BUNDLE_VAR_warehouse_id is needed by every
+# `databricks bundle` command because `bundle run` re-evaluates the config.
+# ---------------------------------------------------------------------------
+env:
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+  DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
+  BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+
 jobs:
 
   # === 1. VALIDATE (every PR and push) ====================================
@@ -52,10 +61,6 @@ jobs:
 
       - name: Validate bundle
         run: databricks bundle validate
-        env:
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
-          BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
 
   # === 2. DEPLOY DEV (push to dev branch) =================================
   deploy-dev:
@@ -70,16 +75,9 @@ jobs:
 
       - name: Deploy bundle
         run: databricks bundle deploy -t dev
-        env:
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
-          BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
 
       - name: Start app
         run: databricks bundle run stock_signal_app -t dev
-        env:
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
 
   # === 3. DEPLOY PROD (push to main branch) ===============================
   deploy-prod:
@@ -94,22 +92,12 @@ jobs:
 
       - name: Deploy bundle
         run: databricks bundle deploy -t prod
-        env:
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
-          BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
 
       - name: Start app
         run: databricks bundle run stock_signal_app -t prod
-        env:
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
 
       - name: Trigger pipeline job
         run: databricks bundle run stock_signal_pipeline -t prod
-        env:
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
 
   # === 4. MANUAL DEPLOY (workflow_dispatch) ================================
   deploy-manual:
@@ -124,13 +112,6 @@ jobs:
 
       - name: Deploy bundle
         run: databricks bundle deploy -t ${{ inputs.target }}
-        env:
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
-          BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
 
       - name: Start app
         run: databricks bundle run stock_signal_app -t ${{ inputs.target }}
-        env:
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
