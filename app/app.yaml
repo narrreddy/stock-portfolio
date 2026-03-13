@@ -12,7 +12,7 @@ command:
 
 env:
   - name: DATABRICKS_WAREHOUSE_ID
-    valueFrom: warehouse-id
+    value: ""
 
   - name: STREAMLIT_GATHER_USAGE_STATS
     value: "false"
