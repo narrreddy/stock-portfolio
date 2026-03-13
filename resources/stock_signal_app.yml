@@ -20,11 +20,17 @@ resources:
           - streamlit_app.py
           - --server.port
           - "8501"
+          - --server.headless
+          - "true"
         env:
           - name: DATABRICKS_WAREHOUSE_ID
             value: "${var.warehouse_id}"
           - name: STREAMLIT_GATHER_USAGE_STATS
             value: "false"
+          - name: STOCK_CATALOG
+            value: "${var.catalog}"
+          - name: STOCK_SCHEMA
+            value: "${var.schema}"
 
       permissions:
         - level: CAN_USE
