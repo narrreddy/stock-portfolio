@@ -34,6 +34,12 @@ GOLD_SIG = f"{CATALOG}.{SCHEMA}.trade_signals"
 GOLD_PORT = f"{CATALOG}.{SCHEMA}.portfolio_state"
 
 
+def _get_server_hostname() -> str:
+    """Strip protocol from cfg.host — SQL connector needs bare hostname."""
+    host = cfg.host or ""
+    return host.replace("https://", "").replace("http://", "").rstrip("/")
+
+
 def _get_http_path() -> str:
     wid = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
     return f"/sql/1.0/warehouses/{wid}"
@@ -43,7 +49,7 @@ def _get_http_path() -> str:
 def get_connection():
     """Connect to SQL warehouse using OAuth (Databricks Apps service principal)."""
     return dbsql.connect(
-        server_hostname=cfg.host,
+        server_hostname=_get_server_hostname(),
         http_path=_get_http_path(),
         credentials_provider=lambda: cfg.authenticate,
     )
