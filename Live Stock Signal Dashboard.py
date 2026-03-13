@@ -660,6 +660,7 @@ print("Project structure defined. Ready for modular asset implementation.")
 # ── Streaming Pipeline: Bronze → Silver (indicators) + Gold (signals) ─────────
 # Enhanced with: Silver dedup MERGE, 2-of-3 SELL logic, signal scoring,
 #                cooldown, stop-loss/take-profit
+# FIX: ignoreDeletes + ignoreChanges to survive TRUNCATE & MERGE on Bronze
 
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
@@ -790,53 +791,34 @@ def compute_indicators(key, pdf_iter, state):
 # ── Signal Scoring Function ────────────────────────────────────────
 @F.udf(DoubleType())
 def compute_signal_score(signal, sma20, sma50, rsi, vi_pos, vi_neg):
-    """Compute composite signal strength score (0-100).
-    
-    For BUY: higher score = stronger bullish alignment
-    For SELL: higher score = stronger bearish alignment
-    Each component normalized to 0-100, then weighted.
-    """
+    """Compute composite signal strength score (0-100)."""
     if any(v is None for v in [sma20, sma50, rsi, vi_pos, vi_neg]):
         return 0.0
     
     if signal == "BUY":
-        # SMA: how far above SMA50 is SMA20 (capped at 5% spread)
         sma_spread = min((sma20 - sma50) / sma50 * 100, 5.0) / 5.0 * 100
-        # RSI: distance below overbought (lower = more room to run)
-        rsi_score = max(0, (70 - rsi) / 40) * 100  # 30→70 maps to 100→0
-        # Vortex: spread of VI+ over VI-
+        rsi_score = max(0, (70 - rsi) / 40) * 100
         vortex_spread = min((vi_pos - vi_neg), 0.3) / 0.3 * 100
     elif signal == "SELL":
         sma_spread = min((sma50 - sma20) / sma50 * 100, 5.0) / 5.0 * 100
-        rsi_score = max(0, (rsi - 30) / 40) * 100  # 30→70 maps to 0→100
+        rsi_score = max(0, (rsi - 30) / 40) * 100
         vortex_spread = min((vi_neg - vi_pos), 0.3) / 0.3 * 100
     else:
         return 0.0
     
-    # Clamp components to [0, 100]
     sma_spread    = max(0.0, min(100.0, sma_spread))
     rsi_score     = max(0.0, min(100.0, rsi_score))
     vortex_spread = max(0.0, min(100.0, vortex_spread))
     
-    # Weighted composite (W_SMA=0.35, W_RSI=0.35, W_VORTEX=0.30)
     return round(0.35 * sma_spread + 0.35 * rsi_score + 0.30 * vortex_spread, 1)
 
 
 def write_indicators_and_signals(batch_df, epoch_id):
-    """foreachBatch: MERGE indicators to Silver, scored signals to Gold.
-    
-    Fixes over original:
-    1. Silver uses MERGE (not append) to prevent duplicates on re-run
-    2. SELL uses 2-of-3 conditions (not all-3) for faster exit signals
-    3. Signal strength scoring (0-100)
-    4. Cooldown: suppress same-direction signals within SIGNAL_COOLDOWN_BARS
-    5. Stop-loss / take-profit price levels on each signal
-    """
+    """foreachBatch: MERGE indicators to Silver, scored signals to Gold."""
     if batch_df.isEmpty():
         return
 
     # --- SILVER: DEDUP MERGE instead of append ---
-    # This prevents duplicate indicator rows when checkpoints are cleared
     batch_df.createOrReplaceTempView("_silver_staging")
     spark.sql(f"""
     MERGE INTO {SILVER} AS target
@@ -853,7 +835,6 @@ def write_indicators_and_signals(batch_df, epoch_id):
     """)
 
     # --- Generate BUY signals (strict: ALL 3 conditions) ---
-    # BUY = high confidence entry, require full alignment
     buy_candidates = batch_df.filter(
         (F.col("sma20") > F.col("sma50")) &
         (F.col("rsi").isNotNull()) & (F.col("rsi") < RSI_OVERBOUGHT) &
@@ -862,8 +843,6 @@ def write_indicators_and_signals(batch_df, epoch_id):
     ).withColumn("signal", F.lit("BUY"))
 
     # --- Generate SELL signals (relaxed: ANY 2 of 3 conditions) ---
-    # SELL = protective exit, should be MORE sensitive than entry
-    # Condition flags: 1 if bearish, 0 if not
     sell_base = batch_df.filter(
         F.col("sma20").isNotNull() & F.col("sma50").isNotNull() &
         F.col("rsi").isNotNull() &
@@ -879,7 +858,7 @@ def write_indicators_and_signals(batch_df, epoch_id):
     )
     
     sell_candidates = sell_base.filter(
-        F.col("_sell_count") >= 2  # ANY 2 of 3 bearish conditions
+        F.col("_sell_count") >= 2
     ).withColumn(
         "signal", F.lit("SELL")
     ).drop("_sell_sma", "_sell_rsi", "_sell_vortex", "_sell_count")
@@ -931,8 +910,8 @@ def write_indicators_and_signals(batch_df, epoch_id):
             "left"
         )
         
-        # Cooldown window = SIGNAL_COOLDOWN_BARS * 5 minutes
-        cooldown_seconds = SIGNAL_COOLDOWN_BARS * 5 * 60
+        # FIX: Use BAR_INTERVAL_MIN (10m) instead of hardcoded 5m
+        cooldown_seconds = SIGNAL_COOLDOWN_BARS * BAR_INTERVAL_MIN * 60
         scored = scored.filter(
             F.col("last_signal_time").isNull() |
             (F.unix_timestamp(F.col("timestamp")) - F.unix_timestamp(F.col("last_signal_time"))
@@ -961,7 +940,17 @@ def write_indicators_and_signals(batch_df, epoch_id):
 
 
 # ── Read Bronze as stream ───────────────────────────────────────
-bronze_stream = spark.readStream.format("delta").table(BRONZE)
+# FIX: ignoreDeletes + ignoreChanges to survive TRUNCATE and MERGE on Bronze.
+# Without these, the stream crashes with DELTA_SOURCE_IGNORE_DELETE after
+# any TRUNCATE (which deletes Parquet files) or MERGE (which updates rows).
+# The Silver MERGE dedup ensures no duplicate processing from reprocessed rows.
+bronze_stream = (
+    spark.readStream
+    .format("delta")
+    .option("ignoreDeletes", True)
+    .option("ignoreChanges", True)
+    .table(BRONZE)
+)
 
 # Apply stateful processing: group by ticker, compute indicators
 indicator_stream = (
