@@ -3,10 +3,11 @@
 Reads from Delta tables in Unity Catalog via Databricks SQL connector.
 Displays candlestick charts, technical indicators, BUY signals, and portfolio.
 
-Environment variables (set in app.yaml or DABs config):
-  DATABRICKS_SERVER_HOSTNAME  - workspace hostname (auto-set by Databricks Apps)
-  DATABRICKS_HTTP_PATH        - SQL warehouse HTTP path
-  DATABRICKS_TOKEN            - access token (auto-set by Databricks Apps)
+Environment variables (set by Databricks Apps runtime or DABs config):
+  DATABRICKS_HOST             - workspace URL (auto-set by Databricks Apps)
+  DATABRICKS_CLIENT_ID        - service principal client ID (auto-set)
+  DATABRICKS_CLIENT_SECRET    - OAuth secret (auto-set)
+  DATABRICKS_HTTP_PATH        - SQL warehouse HTTP path (optional override)
   DATABRICKS_WAREHOUSE_ID     - alternative to HTTP_PATH (auto-builds path)
   STOCK_CATALOG               - Unity Catalog catalog (default: stockapp)
   STOCK_SCHEMA                - Unity Catalog schema  (default: production)
@@ -18,6 +19,18 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from databricks import sql as dbsql
+from databricks.sdk.core import ApiClient, Config, HeaderFactory
+
+
+def credential_provider() -> HeaderFactory:
+    """Build OAuth credential provider for Databricks Apps service principal."""
+    config = Config(
+        host=os.getenv("DATABRICKS_HOST"),
+        client_id=os.getenv("DATABRICKS_CLIENT_ID"),
+        client_secret=os.getenv("DATABRICKS_CLIENT_SECRET"),
+    )
+    return config.authenticate
+
 
 # ── Configuration (from env vars or defaults) ────────────────────────────
 CATALOG = os.getenv("STOCK_CATALOG", "stockapp")
@@ -26,6 +39,13 @@ BRONZE = f"{CATALOG}.{SCHEMA}.raw_market_data"
 SILVER = f"{CATALOG}.{SCHEMA}.technical_indicators"
 GOLD_SIG = f"{CATALOG}.{SCHEMA}.trade_signals"
 GOLD_PORT = f"{CATALOG}.{SCHEMA}.portfolio_state"
+
+
+def _get_server_hostname() -> str:
+    """Extract bare hostname from DATABRICKS_HOST URL."""
+    host = os.getenv("DATABRICKS_HOST", "")
+    # Strip protocol prefix — SQL connector needs bare hostname
+    return host.replace("https://", "").replace("http://", "").rstrip("/")
 
 
 def _get_http_path() -> str:
@@ -39,11 +59,11 @@ def _get_http_path() -> str:
 
 @st.cache_resource
 def get_connection():
-    """Establish Databricks SQL connection."""
+    """Establish Databricks SQL connection using OAuth (Databricks Apps)."""
     return dbsql.connect(
-        server_hostname=os.getenv("DATABRICKS_SERVER_HOSTNAME"),
+        server_hostname=_get_server_hostname(),
         http_path=_get_http_path(),
-        access_token=os.getenv("DATABRICKS_TOKEN"),
+        credentials_provider=credential_provider(),
     )
 
 
