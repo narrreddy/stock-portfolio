@@ -14,20 +14,20 @@ display(spark.sql("SHOW CATALOGS"))
 
 # DBTITLE 1,Create Missing Audit Tables (SQL)
 # MAGIC %sql
-# MAGIC -- Add enhanced columns to existing tables (idempotent check)
-# MAGIC -- This cell can be re-run safely.
+# MAGIC -- Verify all tables exist and check row counts.
+# MAGIC -- Safe to re-run anytime. No data modification.
 # MAGIC
-# MAGIC SELECT 'trade_log' AS tbl, COUNT(*) AS rows FROM stockapp.production.trade_log
+# MAGIC SELECT 'raw_market_data' AS tbl, COUNT(*) AS rows FROM stockapp.production.raw_market_data
 # MAGIC UNION ALL
-# MAGIC SELECT 'data_quality_events', COUNT(*) FROM stockapp.production.data_quality_events
+# MAGIC SELECT 'technical_indicators', COUNT(*) FROM stockapp.production.technical_indicators
 # MAGIC UNION ALL
 # MAGIC SELECT 'trade_signals', COUNT(*) FROM stockapp.production.trade_signals
 # MAGIC UNION ALL
 # MAGIC SELECT 'portfolio_state', COUNT(*) FROM stockapp.production.portfolio_state
 # MAGIC UNION ALL
-# MAGIC SELECT 'raw_market_data', COUNT(*) FROM stockapp.production.raw_market_data
+# MAGIC SELECT 'trade_log', COUNT(*) FROM stockapp.production.trade_log
 # MAGIC UNION ALL
-# MAGIC SELECT 'technical_indicators', COUNT(*) FROM stockapp.production.technical_indicators
+# MAGIC SELECT 'data_quality_events', COUNT(*) FROM stockapp.production.data_quality_events
 
 # COMMAND ----------
 
@@ -49,23 +49,27 @@ DQ_EVENTS = f"{CATALOG}.{SCHEMA}.data_quality_events"
 CHECKPOINT_VOL = f"/Volumes/{CATALOG}/{SCHEMA}/checkpoints"
 
 # Ticker mapping: display_name → Yahoo Finance symbol
-# Canadian ETFs need .TO (TSX); MSFT/NVDA use US listing
+# CDRs use .NE (NEO Exchange); TSX ETFs use .TO
 TICKER_MAP = {
-    "MSFT": "MSFT",        # Microsoft CDR (CAD Hedged) — US ticker
-    "NVDA": "NVDA",        # Nvidia CDR (CAD Hedged) — US ticker
-    "TEC":  "TEC.TO",      # TD Global Tech Leaders Index ETF
-    "VCNS": "VCNS.TO",     # Vanguard Conservative ETF Portfolio
-    "XAW":  "XAW.TO",      # iShares Core MSCI All Country World ex Canada
-    "XDG":  "XDG.TO",      # iShares Core MSCI Global Quality Dividend
-    "XDV":  "XDV.TO",      # iShares Canadian Select Dividend Index ETF
-    "XEG":  "XEG.TO",      # iShares S&P/TSX Capped Energy Index ETF
-    "XGD":  "XGD.TO",      # iShares S&P/TSX Global Gold Index ETF
-    "XIC":  "XIC.TO",      # iShares Core S&P/TSX Capped Composite
-    "XUS":  "XUS.TO",      # iShares Core S&P 500 Index ETF (CAD)
-    "ZEB":  "ZEB.TO",      # BMO Equal Weight Banks Index ETF
-    "ZRE":  "ZRE.TO",      # BMO Equal Weight REITs Index ETF
+    "MSFT": "MSFT.NE",    # Microsoft CDR (CAD Hedged) — NEO Exchange
+    "NVDA": "NVDA.NE",    # Nvidia CDR (CAD Hedged) — NEO Exchange
+    "TEC":  "TEC.TO",     # TD Global Tech Leaders Index ETF
+    "VCNS": "VCNS.TO",    # Vanguard Conservative ETF Portfolio
+    "XAW":  "XAW.TO",     # iShares Core MSCI All Country World ex Canada Index ETF
+    "XDG":  "XDG.TO",     # iShares Core MSCI Global Quality Dividend Index ETF
+    "XDV":  "XDV.TO",     # iShares Canadian Select Dividend Index ETF
+    "XEG":  "XEG.TO",     # iShares S&P/TSX Capped Energy Index ETF
+    "XGD":  "XGD.TO",     # iShares S&P/TSX Global Gold Index ETF
+    "XIC":  "XIC.TO",     # iShares Core S&P/TSX Capped Composite Index ETF
+    "XUS":  "XUS.TO",     # iShares Core S&P 500 Index ETF (CAD)
+    "ZEB":  "ZEB.TO",     # BMO Equal Weight Banks Index ETF
+    "ZRE":  "ZRE.TO",     # BMO Equal Weight REITs Index ETF
 }
 TICKERS = list(TICKER_MAP.keys())  # display names used in Delta tables
+
+# ── Data Parameters ───────────────────────────────────────────
+INGEST_PERIOD    = "1mo"   # Past 1 month of history
+BAR_INTERVAL_MIN = 10      # 10-minute bars (resampled from 5m yfinance data)
 
 # Indicator parameters
 SMA_SHORT      = 20
@@ -79,7 +83,7 @@ BUY_SHARES     = 100  # shares per BUY signal
 # ── Risk Management Parameters ──────────────────────────────────
 STOP_LOSS_PCT    = 0.03   # 3% stop-loss from entry price
 TAKE_PROFIT_PCT  = 0.06   # 6% take-profit from entry price (2:1 reward-risk)
-SIGNAL_COOLDOWN_BARS = 6  # Suppress same-direction signals within 6 bars (30 min)
+SIGNAL_COOLDOWN_BARS = 3  # Suppress same-direction signals within 3 bars (30 min at 10m)
 MAX_POSITION_PCT = 0.15   # Max 15% portfolio allocation per ticker
 
 # ── Signal Scoring Weights (must sum to 1.0) ────────────────────
@@ -87,9 +91,10 @@ W_SMA    = 0.35   # SMA crossover strength
 W_RSI    = 0.35   # RSI distance from threshold
 W_VORTEX = 0.30   # Vortex spread
 
-print(f"Config loaded: {CATALOG}.{SCHEMA} | Tickers: {TICKERS}")
-print(f"Risk: SL={STOP_LOSS_PCT:.0%}, TP={TAKE_PROFIT_PCT:.0%}, Cooldown={SIGNAL_COOLDOWN_BARS} bars")
-print(f"Score weights: SMA={W_SMA}, RSI={W_RSI}, Vortex={W_VORTEX}")
+print(f"Config loaded: {CATALOG}.{SCHEMA} | {len(TICKERS)} tickers: {TICKERS}")
+print(f"CDRs: MSFT.NE, NVDA.NE | TSX ETFs: *.TO")
+print(f"Data: {INGEST_PERIOD} history, {BAR_INTERVAL_MIN}m bars (resampled from 5m)")
+print(f"Risk: SL={STOP_LOSS_PCT:.0%}, TP={TAKE_PROFIT_PCT:.0%}, Cooldown={SIGNAL_COOLDOWN_BARS} bars ({SIGNAL_COOLDOWN_BARS * BAR_INTERVAL_MIN}min)")
 
 # COMMAND ----------
 
@@ -252,6 +257,7 @@ else:
 
 # DBTITLE 1,Install Pypi dependencies (pip)
 # ── Yahoo Finance Batch Ingest → Bronze (DEDUP MERGE + CIRCUIT BREAKER) ────
+# Fetches 5m data from yfinance and resamples to 10m bars (no native 10m interval).
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -275,6 +281,31 @@ def _fetch_with_retry(yf_symbol, period, interval, max_retries=3):
                 _time.sleep(wait)
             else:
                 raise
+
+def _resample_to_10m(df):
+    """Resample 5-minute bars to 10-minute OHLCV bars.
+    
+    yfinance has no native 10m interval, so we fetch 5m and aggregate:
+      Open   = first open in 10m window
+      High   = max high in 10m window
+      Low    = min low in 10m window
+      Close  = last close in 10m window
+      Volume = sum of volume in 10m window
+    """
+    df = df.sort_values("timestamp")
+    df = df.set_index("timestamp")
+    
+    resampled = df.resample("10min").agg({
+        "ticker": "first",
+        "open":   "first",
+        "high":   "max",
+        "low":    "min",
+        "close":  "last",
+        "volume": "sum",
+    }).dropna(subset=["close"])  # Drop empty windows (non-trading hours)
+    
+    resampled = resampled.reset_index()
+    return resampled
 
 def _apply_circuit_breaker(df, ticker):
     """Validate price data and flag/remove anomalous rows.
@@ -327,7 +358,7 @@ def _apply_circuit_breaker(df, ticker):
         })
         df = df[~neg_vol_mask].copy()
     
-    # 4) OHLC consistency: high must be >= low, close within [low, high]
+    # 4) OHLC consistency: high must be >= low
     ohlc_bad = (df["high"] < df["low"])
     ohlc_count = ohlc_bad.sum()
     if ohlc_count > 0:
@@ -339,18 +370,15 @@ def _apply_circuit_breaker(df, ticker):
         })
         df = df[~ohlc_bad].copy()
     
-    # 5) Flag (but don't remove) anomalous price swings > MAX_BAR_PCT_CHANGE
+    # 5) Flag anomalous price swings; remove extreme spikes (>50%)
     if len(df) > 1:
         df = df.sort_values("timestamp")
         pct_change = df["close"].pct_change().abs()
         spike_mask = pct_change > MAX_BAR_PCT_CHANGE
         spike_count = spike_mask.sum()
         if spike_count > 0:
-            spike_timestamps = df.loc[spike_mask, "timestamp"].tolist()
             spike_values = pct_change[spike_mask].tolist()
             worst = max(spike_values)
-            # Flag but keep the data (spikes can be legitimate in volatile markets)
-            # Remove only extreme spikes (>50%) which are almost certainly data errors
             extreme_mask = pct_change > 0.50
             extreme_count = extreme_mask.sum()
             if extreme_count > 0:
@@ -376,10 +404,15 @@ def _apply_circuit_breaker(df, ticker):
     return df, dq
 
 
-def ingest_tickers(ticker_map, period="7d", interval="5m"):
-    """Fetch OHLCV data and MERGE into Bronze Delta table (idempotent).
+def ingest_tickers(ticker_map, period="1mo", interval="5m"):
+    """Fetch OHLCV data, resample to 10m bars, and MERGE into Bronze.
     
-    Pipeline: Fetch → Circuit Breaker → MERGE (dedup) → DQ Log
+    Pipeline: Fetch 5m → Resample 10m → Circuit Breaker → MERGE (dedup) → DQ Log
+    
+    Args:
+        ticker_map: dict mapping display_name -> Yahoo Finance symbol
+        period: yfinance period (default '1mo' for past month)
+        interval: yfinance fetch interval (default '5m', resampled to 10m)
     """
     frames = []
     dq_events = []  # Collect data quality issues
@@ -397,6 +430,7 @@ def ingest_tickers(ticker_map, period="7d", interval="5m"):
                 })
                 continue
             
+            raw_count = len(hist)
             df = hist.reset_index().rename(columns={
                 "Datetime": "timestamp", "Date": "timestamp",
                 "Open": "open", "High": "high", "Low": "low",
@@ -407,7 +441,11 @@ def ingest_tickers(ticker_map, period="7d", interval="5m"):
             df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
             df["volume"] = df["volume"].astype("int64")
             
-            # ── CIRCUIT BREAKER: validate before writing ─────────────────
+            # ── RESAMPLE: 5m → 10m bars ──────────────────────────────
+            df = _resample_to_10m(df)
+            df["volume"] = df["volume"].astype("int64")
+            
+            # ── CIRCUIT BREAKER: validate before writing ───────────────
             df, ticker_dq = _apply_circuit_breaker(df, display_name)
             dq_events.extend(ticker_dq)
             
@@ -416,7 +454,7 @@ def ingest_tickers(ticker_map, period="7d", interval="5m"):
                 continue
             
             frames.append(df)
-            print(f"  ✓ {display_name} ({yf_symbol}): {len(df)} valid rows")
+            print(f"  ✓ {display_name} ({yf_symbol}): {raw_count} 5m bars → {len(df)} 10m bars")
             
         except Exception as e:
             print(f"  ✗ {display_name} ({yf_symbol}): {e}")
@@ -470,12 +508,12 @@ def ingest_tickers(ticker_map, period="7d", interval="5m"):
         dq_df.write.format("delta").mode("append").saveAsTable(DQ_EVENTS)
         print(f"  Logged {len(dq_events)} data quality event(s) to {DQ_EVENTS}")
     
-    print(f"\n✔ MERGE complete: {inserted} new + {updated} updated = {len(pdf)} total rows processed")
+    print(f"\n✔ MERGE complete: {inserted} new + {updated} updated = {len(pdf)} total 10m bars processed")
     return len(pdf)
 
-# Run ingest: 7 days of 5-minute bars
-print("Ingesting Yahoo Finance data (past week)...")
-row_count = ingest_tickers(TICKER_MAP, period="7d", interval="5m")
+# Run ingest: 1 month of 10-minute bars (fetched as 5m, resampled)
+print(f"Ingesting Yahoo Finance data ({INGEST_PERIOD} history, {BAR_INTERVAL_MIN}m bars)...")
+row_count = ingest_tickers(TICKER_MAP, period=INGEST_PERIOD, interval="5m")
 
 # COMMAND ----------
 
@@ -484,13 +522,13 @@ row_count = ingest_tickers(TICKER_MAP, period="7d", interval="5m")
 from pyspark.sql import functions as F
 from datetime import datetime, timezone
 
-# Expected bars: ~78 bars/day (6.5 trading hours × 12 bars/hr) × 5 trading days = ~390
-EXPECTED_BARS_PER_DAY = 78
-TRADING_DAYS = 5  # Conservative: 5 of 7 calendar days
-MIN_EXPECTED_BARS = int(EXPECTED_BARS_PER_DAY * TRADING_DAYS * 0.8)  # 80% threshold
-GAP_THRESHOLD_MINUTES = 15  # Flag gaps > 3 consecutive bars
+# Expected: ~39 bars/day (6.5 trading hours × 6 bars/hr at 10m) × ~22 trading days/month
+EXPECTED_BARS_PER_DAY = 39
+TRADING_DAYS = 22  # ~1 month of trading days
+MIN_EXPECTED_BARS = int(EXPECTED_BARS_PER_DAY * TRADING_DAYS * 0.7)  # 70% threshold
+GAP_THRESHOLD_MINUTES = 25  # Flag gaps > 2 consecutive 10m bars
 
-print("\n── Data Quality Checks ──")
+print(f"\n── Data Quality Checks ({BAR_INTERVAL_MIN}m bars, {INGEST_PERIOD} history) ──")
 dq_issues = []
 
 # 1️⃣ Bar count per ticker
@@ -554,7 +592,6 @@ latest_bar = spark.sql(f"SELECT MAX(timestamp) AS latest FROM {BRONZE}").collect
 if latest_bar:
     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
     staleness_hours = (now_utc - latest_bar).total_seconds() / 3600
-    # During market hours (Mon-Fri 9:30-16:00 ET), data > 1 hour old is stale
     if staleness_hours > 24:
         print(f"\n  ⚠ STALE DATA: Latest bar is {staleness_hours:.1f} hours old ({latest_bar})")
         dq_issues.append({
