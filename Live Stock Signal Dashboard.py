@@ -1,23 +1,82 @@
 # Databricks notebook source
 # DBTITLE 1,Project Initialization and Delta Setup
-# MAGIC %md
-# MAGIC ## Live Stock Signal Dashboard
-# MAGIC
-# MAGIC **Medallion Architecture** streaming pipeline with real-time technical indicators and BUY signal generation.
-# MAGIC
-# MAGIC | Layer | Table | Description |
-# MAGIC |-------|-------|-------------|
-# MAGIC | Bronze | `raw_market_data` | Raw OHLCV from Yahoo Finance |
-# MAGIC | Silver | `technical_indicators` | SMA20, SMA50, RSI, Vortex per ticker |
-# MAGIC | Gold | `trade_signals` | BUY signals (SMA20>SMA50, RSI<70, VI+>VI-) |
-# MAGIC | Gold | `portfolio_state` | Holdings, avg entry, unrealized PnL |
-# MAGIC
-# MAGIC **Stack**: Spark Structured Streaming · `applyInPandasWithState` · Delta Lake · Plotly · Streamlit UI
+# Unity Catalog Discovery Step
+# Find available catalogs, then use a valid one for table creation
+
+display(spark.sql("SHOW CATALOGS"))
+
+# After you identify your catalog, set catalog_name and rerun schema/table creation.
+# For example:
+#   catalog_name = 'your_catalog' (from the output above)
+# Continue once the catalog name is known.
 
 # COMMAND ----------
 
 # DBTITLE 1,Create Unity Catalog, Schema, and Delta Tables
-# MAGIC %pip install yfinance plotly --quiet
+# Setup Unity Catalog, Schema, and Delta Tables
+
+# Names
+catalog_name = "stockapp"
+schema_name = "production"
+
+# Create new catalog and schema
+spark.sql(f"CREATE CATALOG IF NOT EXISTS {catalog_name}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog_name}.{schema_name}")
+
+# Bronze table: raw market data
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {catalog_name}.{schema_name}.raw_market_data (
+  ticker STRING,
+  timestamp TIMESTAMP,
+  open DOUBLE,
+  high DOUBLE,
+  low DOUBLE,
+  close DOUBLE,
+  volume LONG
+) USING DELTA
+""")
+
+# Silver table: technical indicators
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {catalog_name}.{schema_name}.technical_indicators (
+  ticker STRING,
+  timestamp TIMESTAMP,
+  sma20 DOUBLE,
+  sma50 DOUBLE,
+  rsi DOUBLE,
+  vortex_positive DOUBLE,
+  vortex_negative DOUBLE
+) USING DELTA
+""")
+
+# Gold table: signals
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {catalog_name}.{schema_name}.trade_signals (
+  ticker STRING,
+  timestamp TIMESTAMP,
+  signal STRING,
+  sma20 DOUBLE,
+  sma50 DOUBLE,
+  rsi DOUBLE,
+  vortex_positive DOUBLE,
+  vortex_negative DOUBLE
+) USING DELTA
+""")
+
+# Gold table: portfolio state
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {catalog_name}.{schema_name}.portfolio_state (
+  ticker STRING,
+  holdings LONG,
+  avg_entry_price DOUBLE,
+  current_price DOUBLE,
+  unrealized_pnl DOUBLE,
+  last_signal STRING,
+  last_signal_time TIMESTAMP
+) USING DELTA
+""")
+
+print(f"Catalog: {catalog_name}, Schema: {schema_name} and all Delta tables were created.")
 
 # COMMAND ----------
 
@@ -31,22 +90,40 @@ GOLD_SIG  = f"{CATALOG}.{SCHEMA}.trade_signals"
 GOLD_PORT = f"{CATALOG}.{SCHEMA}.portfolio_state"
 CHECKPOINT_VOL = f"/Volumes/{CATALOG}/{SCHEMA}/checkpoints"
 
-TICKERS = ["AAPL", "MSFT", "NVDA", "GOOG", "TSLA"]
+# Ticker mapping: display_name → Yahoo Finance symbol
+# Canadian ETFs need .TO (TSX); MSFT/NVDA use US listing
+TICKER_MAP = {
+    "MSFT": "MSFT",        # Microsoft CDR (CAD Hedged) — US ticker
+    "NVDA": "NVDA",        # Nvidia CDR (CAD Hedged) — US ticker
+    "TEC":  "TEC.TO",      # TD Global Tech Leaders Index ETF
+    "VCNS": "VCNS.TO",     # Vanguard Conservative ETF Portfolio
+    "XAW":  "XAW.TO",      # iShares Core MSCI All Country World ex Canada
+    "XDG":  "XDG.TO",      # iShares Core MSCI Global Quality Dividend
+    "XDV":  "XDV.TO",      # iShares Canadian Select Dividend Index ETF
+    "XEG":  "XEG.TO",      # iShares S&P/TSX Capped Energy Index ETF
+    "XGD":  "XGD.TO",      # iShares S&P/TSX Global Gold Index ETF
+    "XIC":  "XIC.TO",      # iShares Core S&P/TSX Capped Composite
+    "XUS":  "XUS.TO",      # iShares Core S&P 500 Index ETF (CAD)
+    "ZEB":  "ZEB.TO",      # BMO Equal Weight Banks Index ETF
+    "ZRE":  "ZRE.TO",      # BMO Equal Weight REITs Index ETF
+}
+TICKERS = list(TICKER_MAP.keys())  # display names used in Delta tables
 
 # Indicator parameters
-SMA_SHORT  = 20
-SMA_LONG   = 50
-RSI_PERIOD = 14
-VORTEX_PERIOD = 14
+SMA_SHORT      = 20
+SMA_LONG       = 50
+RSI_PERIOD     = 14
+VORTEX_PERIOD  = 14
 RSI_OVERBOUGHT = 70
-BUY_SHARES = 100  # shares per BUY signal
+RSI_OVERSOLD   = 30
+BUY_SHARES     = 100  # shares per BUY signal
 
 print(f"Config loaded: {CATALOG}.{SCHEMA} | Tickers: {TICKERS}")
 
 # COMMAND ----------
 
 # DBTITLE 1,requirements.txt content
-# ── Create Unity Catalog Resources ───────────────────────────────
+# ── Create Unity Catalog Resources ───────────────────────────
 spark.sql(f"CREATE CATALOG IF NOT EXISTS {CATALOG}")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
 
@@ -66,27 +143,27 @@ CREATE TABLE IF NOT EXISTS {BRONZE} (
 # Silver: technical indicators
 spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {SILVER} (
-  ticker          STRING,
-  timestamp       TIMESTAMP,
-  close           DOUBLE,
-  sma20           DOUBLE,
-  sma50           DOUBLE,
-  rsi             DOUBLE,
+  ticker    STRING,
+  timestamp TIMESTAMP,
+  close     DOUBLE,
+  sma20     DOUBLE,
+  sma50     DOUBLE,
+  rsi       DOUBLE,
   vortex_positive DOUBLE,
   vortex_negative DOUBLE
 ) USING DELTA
 """)
 
-# Gold: trade signals
+# Gold: trade signals (BUY + SELL)
 spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {GOLD_SIG} (
-  ticker          STRING,
-  timestamp       TIMESTAMP,
-  signal          STRING,
-  close           DOUBLE,
-  sma20           DOUBLE,
-  sma50           DOUBLE,
-  rsi             DOUBLE,
+  ticker    STRING,
+  timestamp TIMESTAMP,
+  signal    STRING,
+  close     DOUBLE,
+  sma20     DOUBLE,
+  sma50     DOUBLE,
+  rsi       DOUBLE,
   vortex_positive DOUBLE,
   vortex_negative DOUBLE
 ) USING DELTA
@@ -105,15 +182,23 @@ CREATE TABLE IF NOT EXISTS {GOLD_PORT} (
 ) USING DELTA
 """)
 
-# Volume for streaming checkpoints
-spark.sql(f"""
-CREATE VOLUME IF NOT EXISTS {CATALOG}.{SCHEMA}.checkpoints
-COMMENT 'Streaming pipeline checkpoint storage'
-""")
+# Checkpoint volume
+spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{SCHEMA}.checkpoints")
 
-print(f"All UC resources created: {CATALOG}.{SCHEMA}")
+# ── Clear old data (switching tickers) ───────────────────────
+for tbl in [BRONZE, SILVER, GOLD_SIG, GOLD_PORT]:
+    spark.sql(f"TRUNCATE TABLE {tbl}")
+    print(f"  Truncated {tbl}")
+
+# Clear streaming checkpoint so stateful processor resets
+import shutil, os
+chk_path = f"/Volumes/{CATALOG}/{SCHEMA}/checkpoints/indicators"
+if os.path.exists(chk_path):
+    shutil.rmtree(chk_path)
+    print(f"  Cleared checkpoint: {chk_path}")
+
+print(f"\nAll UC resources ready: {CATALOG}.{SCHEMA}")
 print(f"Tables: raw_market_data, technical_indicators, trade_signals, portfolio_state")
-print(f"Volume: checkpoints")
 
 # COMMAND ----------
 
@@ -123,29 +208,36 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 
-def ingest_tickers(tickers, period="5d", interval="5m"):
-    """Fetch OHLCV data for all tickers and write to Bronze Delta table."""
+def ingest_tickers(ticker_map, period="7d", interval="5m"):
+    """Fetch OHLCV data for all tickers and write to Bronze Delta table.
+    
+    Args:
+        ticker_map: dict mapping display_name -> Yahoo Finance symbol
+        period: yfinance period string (e.g. '7d' for past week)
+        interval: bar interval (e.g. '5m' for 5-minute bars)
+    """
     frames = []
-    for t in tickers:
+    for display_name, yf_symbol in ticker_map.items():
         try:
-            hist = yf.Ticker(t).history(period=period, interval=interval)
+            hist = yf.Ticker(yf_symbol).history(period=period, interval=interval)
             if hist.empty:
-                print(f"  ⚠ {t}: no data returned")
+                print(f"  ⚠ {display_name} ({yf_symbol}): no data returned")
                 continue
             df = hist.reset_index().rename(columns={
                 "Datetime": "timestamp", "Date": "timestamp",
                 "Open": "open", "High": "high", "Low": "low",
                 "Close": "close", "Volume": "volume"
             })
-            df["ticker"] = t
+            # Store clean display name (not Yahoo suffix)
+            df["ticker"] = display_name
             df = df[["ticker", "timestamp", "open", "high", "low", "close", "volume"]]
             # Remove timezone info for Delta compatibility
             df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
             df["volume"] = df["volume"].astype("int64")
             frames.append(df)
-            print(f"  ✓ {t}: {len(df)} rows")
+            print(f"  ✓ {display_name} ({yf_symbol}): {len(df)} rows")
         except Exception as e:
-            print(f"  ✗ {t}: {e}")
+            print(f"  ✗ {display_name} ({yf_symbol}): {e}")
 
     if not frames:
         print("No data ingested.")
@@ -157,143 +249,31 @@ def ingest_tickers(tickers, period="5d", interval="5m"):
     print(f"\n✔ Ingested {len(pdf)} total rows to {BRONZE}")
     return len(pdf)
 
-# Run ingest: 5 days of 5-minute bars
-print("Ingesting Yahoo Finance data...")
-row_count = ingest_tickers(TICKERS, period="5d", interval="5m")
+# Run ingest: 7 days of 5-minute bars
+print("Ingesting Yahoo Finance data (past week)...")
+row_count = ingest_tickers(TICKER_MAP, period="7d", interval="5m")
 
 # COMMAND ----------
 
 # DBTITLE 1,Asset Structure Definition
-# ── Technical Indicator Processor (applyInPandasWithState) ──────
-import json
-from typing import Iterator, Tuple
-import pandas as pd
-from pyspark.sql.types import (
-    StructType, StructField, StringType, TimestampType,
-    DoubleType, LongType
-)
+# Project Structure
+"""
+stockapp/
+├── src/
+│   ├── streaming/
+│   │   ├── yahoo_ingest.py           # Streaming ingest from Yahoo Finance
+│   │   ├── stateful_indicators.py    # TransformWithState indicator logic
+│   │   └── signal_portfolio.py       # Signal detection and portfolio management
+│   ├── indicators/indicators.py      # SMA, RSI, Vortex calculation
+│   └── utils/delta_utils.py          # Delta table utilities
+├── streamlit_app.py                  # Databricks Streamlit UI (dashboard)
+├── requirements.txt                  # Python dependencies
+└── README.md                         # Run & deployment instructions
+"""
 
-# State schema: serialized rolling window as JSON
-STATE_SCHEMA = StructType([
-    StructField("prices_json", StringType()),
-])
-
-# Output schema: indicator values
-INDICATOR_SCHEMA = StructType([
-    StructField("ticker",          StringType()),
-    StructField("timestamp",       TimestampType()),
-    StructField("close",           DoubleType()),
-    StructField("sma20",           DoubleType()),
-    StructField("sma50",           DoubleType()),
-    StructField("rsi",             DoubleType()),
-    StructField("vortex_positive", DoubleType()),
-    StructField("vortex_negative", DoubleType()),
-])
-
-
-def compute_indicators(
-    key: Tuple[str],
-    pdf_iter: Iterator[pd.DataFrame],
-    state
-) -> Iterator[pd.DataFrame]:
-    """
-    Stateful processor: maintains rolling window per ticker,
-    computes SMA(20), SMA(50), RSI(14), Vortex(14).
-    """
-    ticker = key[0]
-
-    # Load existing state (rolling price window)
-    if state.exists:
-        prices = json.loads(state.get[0])
-    else:
-        prices = []  # each: [ts_epoch_ms, high, low, close]
-
-    # Collect all new rows from this micro-batch
-    all_new = []
-    for pdf in pdf_iter:
-        for _, r in pdf.iterrows():
-            all_new.append([
-                int(r["timestamp"].timestamp() * 1000),
-                float(r["high"]),
-                float(r["low"]),
-                float(r["close"]),
-            ])
-
-    # Merge, sort, keep last SMA_LONG records
-    combined = prices + all_new
-    combined.sort(key=lambda x: x[0])
-    combined = combined[-SMA_LONG:]
-
-    # Persist updated state
-    state.update((json.dumps(combined),))
-
-    # Extract arrays
-    n = len(combined)
-    ts_arr    = [c[0] for c in combined]
-    highs_arr = [c[1] for c in combined]
-    lows_arr  = [c[2] for c in combined]
-    close_arr = [c[3] for c in combined]
-
-    # Only emit indicators for NEW rows
-    new_ts_set = {nr[0] for nr in all_new}
-    records = []
-
-    for i in range(n):
-        if ts_arr[i] not in new_ts_set:
-            continue  # skip already-emitted historical rows
-
-        # --- SMA ---
-        sma20 = sum(close_arr[max(0, i - SMA_SHORT + 1):i + 1]) / min(SMA_SHORT, i + 1)
-        sma50 = sum(close_arr[max(0, i - SMA_LONG + 1):i + 1])  / min(SMA_LONG, i + 1)
-
-        # --- RSI (14-period) ---
-        rsi = None
-        if i >= RSI_PERIOD:
-            gains, losses = [], []
-            for j in range(i - RSI_PERIOD + 1, i + 1):
-                chg = close_arr[j] - close_arr[j - 1]
-                gains.append(max(chg, 0.0))
-                losses.append(max(-chg, 0.0))
-            avg_gain = sum(gains) / RSI_PERIOD
-            avg_loss = sum(losses) / RSI_PERIOD
-            rsi = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
-
-        # --- Vortex Indicator (14-period) ---
-        #   TR  = max(H-L, |H - prevClose|, |L - prevClose|)
-        #   VM+ = |H_i - L_{i-1}|       VM- = |L_i - H_{i-1}|
-        #   VI+ = sum(VM+,14)/sum(TR,14) VI- = sum(VM-,14)/sum(TR,14)
-        vp, vn = None, None
-        if i >= VORTEX_PERIOD:
-            tr_sum = vm_plus = vm_minus = 0.0
-            for j in range(i - VORTEX_PERIOD + 1, i + 1):
-                tr = max(
-                    highs_arr[j] - lows_arr[j],
-                    abs(highs_arr[j] - close_arr[j - 1]),
-                    abs(lows_arr[j]  - close_arr[j - 1])
-                )
-                tr_sum   += tr
-                vm_plus  += abs(highs_arr[j] - lows_arr[j - 1])
-                vm_minus += abs(lows_arr[j]  - highs_arr[j - 1])
-            if tr_sum > 0:
-                vp = vm_plus  / tr_sum
-                vn = vm_minus / tr_sum
-
-        records.append({
-            "ticker":          ticker,
-            "timestamp":       pd.Timestamp(ts_arr[i], unit="ms"),
-            "close":           close_arr[i],
-            "sma20":           sma20,
-            "sma50":           sma50,
-            "rsi":             rsi,
-            "vortex_positive": vp,
-            "vortex_negative": vn,
-        })
-
-    if records:
-        yield pd.DataFrame(records)
-
-
-print("compute_indicators() defined (applyInPandasWithState).")
+# Each module will be implemented and tested in notebook cells.
+# Once verified, modules can then be copied to file assets for final deployment.
+print("Project structure defined. Ready for modular asset implementation.")
 
 # COMMAND ----------
 
@@ -302,7 +282,7 @@ print("compute_indicators() defined (applyInPandasWithState).")
 from pyspark.sql import functions as F
 
 def write_indicators_and_signals(batch_df, epoch_id):
-    """foreachBatch: write indicators to Silver, BUY signals to Gold."""
+    """foreachBatch: write indicators to Silver, BUY+SELL signals to Gold."""
     if batch_df.isEmpty():
         return
 
@@ -310,22 +290,35 @@ def write_indicators_and_signals(batch_df, epoch_id):
     batch_df.write.format("delta").mode("append").saveAsTable(SILVER)
 
     # --- Generate BUY signals ---
-    signals = batch_df.filter(
+    buy_signals = batch_df.filter(
         (F.col("sma20") > F.col("sma50")) &
         (F.col("rsi").isNotNull()) & (F.col("rsi") < RSI_OVERBOUGHT) &
         (F.col("vortex_positive").isNotNull()) &
         (F.col("vortex_positive") > F.col("vortex_negative"))
     ).withColumn("signal", F.lit("BUY"))
 
-    sig_count = signals.count()
+    # --- Generate SELL signals ---
+    sell_signals = batch_df.filter(
+        (F.col("sma20") < F.col("sma50")) &
+        (F.col("rsi").isNotNull()) & (F.col("rsi") > RSI_OVERSOLD) &
+        (F.col("vortex_positive").isNotNull()) &
+        (F.col("vortex_positive") < F.col("vortex_negative"))
+    ).withColumn("signal", F.lit("SELL"))
+
+    # Combine and write all signals
+    all_signals = buy_signals.unionByName(sell_signals)
+    sig_count = all_signals.count()
+    buy_count = buy_signals.count()
+    sell_count = sell_signals.count()
+
     if sig_count > 0:
-        signals.select(
+        all_signals.select(
             "ticker", "timestamp", "signal", "close",
             "sma20", "sma50", "rsi", "vortex_positive", "vortex_negative"
         ).write.format("delta").mode("append").saveAsTable(GOLD_SIG)
-        print(f"  Epoch {epoch_id}: {batch_df.count()} indicators, {sig_count} BUY signals")
-    else:
-        print(f"  Epoch {epoch_id}: {batch_df.count()} indicators, 0 signals")
+
+    print(f"  Epoch {epoch_id}: {batch_df.count()} indicators, "
+          f"{buy_count} BUY + {sell_count} SELL signals")
 
 
 # Read Bronze as stream
@@ -361,9 +354,9 @@ print("\n✔ Streaming pipeline completed (availableNow batch).")
 # COMMAND ----------
 
 # DBTITLE 1,Create Unity Catalog Volume: silver_checkpoints
-# ── Portfolio Tracking: MERGE from signals + latest prices ────────
+# ── Portfolio Tracking: MERGE from signals + latest prices ────────────
 
-# Step 1: Build source data (latest price per ticker + latest BUY signal)
+# Step 1: Build source data (latest price per ticker + latest signal)
 spark.sql(f"""
 CREATE OR REPLACE TEMP VIEW portfolio_updates AS
 WITH latest_price AS (
@@ -391,10 +384,18 @@ LEFT JOIN latest_signal s ON p.ticker = s.ticker
 """)
 
 # Step 2: MERGE into portfolio_state
+# BUY  → open new position (if not exists) or keep existing
+# SELL → close position (set holdings to 0)
 spark.sql(f"""
 MERGE INTO {GOLD_PORT} AS target
 USING portfolio_updates AS source
 ON target.ticker = source.ticker
+WHEN MATCHED AND source.last_signal = 'SELL' THEN UPDATE SET
+  target.current_price    = source.current_price,
+  target.unrealized_pnl   = 0,
+  target.holdings         = 0,
+  target.last_signal      = source.last_signal,
+  target.last_signal_time = source.last_signal_time
 WHEN MATCHED THEN UPDATE SET
   target.current_price   = source.current_price,
   target.unrealized_pnl  = (source.current_price - target.avg_entry_price) * target.holdings,
@@ -412,177 +413,3 @@ WHEN NOT MATCHED AND source.last_signal = 'BUY' THEN INSERT (
 
 print(f"✔ Portfolio updated in {GOLD_PORT}")
 display(spark.table(GOLD_PORT))
-
-# COMMAND ----------
-
-# DBTITLE 1,Verification: Pipeline Results
-# ── Verification: Pipeline Results ────────────────────────────
-print("=== Bronze: Raw Market Data ===")
-display(spark.sql(f"SELECT ticker, COUNT(*) AS rows, MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM {BRONZE} GROUP BY ticker ORDER BY ticker"))
-
-print("\n=== Silver: Technical Indicators (sample) ===")
-display(spark.sql(f"SELECT * FROM {SILVER} WHERE rsi IS NOT NULL ORDER BY timestamp DESC LIMIT 15"))
-
-print("\n=== Gold: Trade Signals ===")
-display(spark.sql(f"SELECT ticker, signal, COUNT(*) AS count FROM {GOLD_SIG} GROUP BY ticker, signal ORDER BY ticker"))
-
-print("\n=== Gold: Portfolio State ===")
-display(spark.table(GOLD_PORT))
-
-# COMMAND ----------
-
-# DBTITLE 1,Plotly Dashboard: Candlestick + Indicators + Signals
-# ── Plotly Candlestick Chart with Indicators & Signals ───────
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-
-def plot_ticker_dashboard(ticker_symbol):
-    """Generate a 3-panel chart: OHLC+SMA, RSI, Vortex with BUY markers."""
-    # Fetch data
-    ohlc = spark.sql(f"""
-        SELECT * FROM {BRONZE}
-        WHERE ticker = '{ticker_symbol}'
-        ORDER BY timestamp
-    """).toPandas()
-
-    ind = spark.sql(f"""
-        SELECT * FROM {SILVER}
-        WHERE ticker = '{ticker_symbol}' AND rsi IS NOT NULL
-        ORDER BY timestamp
-    """).toPandas()
-
-    sigs = spark.sql(f"""
-        SELECT * FROM {GOLD_SIG}
-        WHERE ticker = '{ticker_symbol}'
-        ORDER BY timestamp
-    """).toPandas()
-
-    if ohlc.empty:
-        print(f"No data for {ticker_symbol}")
-        return
-
-    fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True,
-        row_heights=[0.55, 0.22, 0.23],
-        vertical_spacing=0.03,
-        subplot_titles=(f"{ticker_symbol} OHLC + SMA", "RSI (14)", "Vortex (14)")
-    )
-
-    # Candlestick
-    fig.add_trace(go.Candlestick(
-        x=ohlc["timestamp"], open=ohlc["open"],
-        high=ohlc["high"], low=ohlc["low"], close=ohlc["close"],
-        name="OHLC", increasing_line_color="#26a69a", decreasing_line_color="#ef5350"
-    ), row=1, col=1)
-
-    # SMA overlays
-    if not ind.empty:
-        fig.add_trace(go.Scatter(
-            x=ind["timestamp"], y=ind["sma20"],
-            mode="lines", name="SMA20", line=dict(color="#2196F3", width=1.2)
-        ), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=ind["timestamp"], y=ind["sma50"],
-            mode="lines", name="SMA50", line=dict(color="#FF9800", width=1.2)
-        ), row=1, col=1)
-
-    # BUY signal markers
-    if not sigs.empty:
-        fig.add_trace(go.Scatter(
-            x=sigs["timestamp"], y=sigs["close"],
-            mode="markers", name="BUY Signal",
-            marker=dict(symbol="triangle-up", size=12, color="#00E676",
-                        line=dict(width=1, color="black"))
-        ), row=1, col=1)
-
-    # RSI panel
-    if not ind.empty:
-        fig.add_trace(go.Scatter(
-            x=ind["timestamp"], y=ind["rsi"],
-            mode="lines", name="RSI", line=dict(color="#AB47BC", width=1.2)
-        ), row=2, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red",
-                      annotation_text="Overbought", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green",
-                      annotation_text="Oversold", row=2, col=1)
-
-    # Vortex panel
-    if not ind.empty:
-        fig.add_trace(go.Scatter(
-            x=ind["timestamp"], y=ind["vortex_positive"],
-            mode="lines", name="VI+", line=dict(color="#4CAF50", width=1.2)
-        ), row=3, col=1)
-        fig.add_trace(go.Scatter(
-            x=ind["timestamp"], y=ind["vortex_negative"],
-            mode="lines", name="VI-", line=dict(color="#F44336", width=1.2)
-        ), row=3, col=1)
-
-    fig.update_layout(
-        height=800, template="plotly_dark",
-        title_text=f"{ticker_symbol} — Live Signal Dashboard",
-        xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02)
-    )
-    fig.show()
-
-# Plot first ticker
-plot_ticker_dashboard("AAPL")
-
-# COMMAND ----------
-
-# DBTITLE 1,Deployment Instructions
-# MAGIC %md
-# MAGIC ## Deployment Instructions
-# MAGIC
-# MAGIC ### 1. Run the Pipeline Locally
-# MAGIC Execute cells 2–10 sequentially. The pipeline ingests data, computes indicators, generates signals, and updates the portfolio.
-# MAGIC
-# MAGIC ### 2. Git Repository Structure
-# MAGIC Organize the project files for DABs deployment:
-# MAGIC ```
-# MAGIC stock-signal-dashboard/           # ← git repo root
-# MAGIC ├── databricks.yml                 # Bundle configuration
-# MAGIC ├── app/                           # Streamlit app source
-# MAGIC │   ├── streamlit_app.py
-# MAGIC │   ├── app.yaml
-# MAGIC │   └── requirements.txt
-# MAGIC ├── notebooks/                     # Pipeline notebook
-# MAGIC │   └── Live_Stock_Signal_Dashboard
-# MAGIC └── .github/
-# MAGIC     └── workflows/
-# MAGIC         └── deploy.yml               # CI/CD workflow
-# MAGIC ```
-# MAGIC
-# MAGIC ### 3. Deploy via Databricks Asset Bundles (CLI)
-# MAGIC ```bash
-# MAGIC # Install the Databricks CLI
-# MAGIC pip install databricks-cli
-# MAGIC
-# MAGIC # Authenticate
-# MAGIC databricks auth login --host https://<workspace>.azuredatabricks.net
-# MAGIC
-# MAGIC # Validate, deploy, and run
-# MAGIC databricks bundle validate
-# MAGIC databricks bundle deploy -t dev --var="warehouse_id=<YOUR_WAREHOUSE_ID>"
-# MAGIC databricks bundle run stock_signal_app -t dev
-# MAGIC ```
-# MAGIC
-# MAGIC ### 4. Deploy via GitHub Actions
-# MAGIC Add these **GitHub Secrets** to your repository:
-# MAGIC | Secret | Value |
-# MAGIC |--------|-------|
-# MAGIC | `DATABRICKS_TOKEN` | Service principal access token |
-# MAGIC | `DATABRICKS_HOST` | `https://<workspace>.azuredatabricks.net` |
-# MAGIC | `DATABRICKS_WAREHOUSE_ID` | SQL warehouse ID |
-# MAGIC
-# MAGIC Then:
-# MAGIC * Push to `dev` branch → auto-deploys to **dev** target
-# MAGIC * Push to `main` branch → auto-deploys to **prod** target
-# MAGIC * Open a PR → validates the bundle (no deploy)
-# MAGIC * Use **Actions → Run workflow** for manual target selection
-# MAGIC
-# MAGIC ### 5. Continuous Streaming Mode
-# MAGIC Change `trigger(availableNow=True)` to `trigger(processingTime="60 seconds")` in Cell 7 for live streaming.
-# MAGIC
-# MAGIC ### 6. Note on Stateful API
-# MAGIC This notebook uses `applyInPandasWithState` (PySpark 3.4+). For Spark 4.0+ runtimes (DBR 16.2+), upgrade to `transformWithStateInPandas` with `StatefulProcessor` for ListState, MapState, TTL, and timers.

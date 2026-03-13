@@ -2,7 +2,7 @@
 
 Reads from Delta tables in Unity Catalog via Databricks SDK Statement
 Execution API (REST).  Displays candlestick charts, technical indicators,
-BUY signals, and portfolio.
+BUY/SELL signals, and portfolio.
 
 Environment variables (auto-set by Databricks Apps runtime):
   DATABRICKS_HOST             - workspace URL
@@ -94,9 +94,8 @@ available_tickers = tickers_df["ticker"].tolist() if not tickers_df.empty else [
 selected_ticker = st.sidebar.selectbox("Select Ticker", available_tickers, index=0)
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Signal Criteria**")
-st.sidebar.markdown("- SMA20 > SMA50")
-st.sidebar.markdown("- RSI < 70")
-st.sidebar.markdown("- Vortex+ > Vortex-")
+st.sidebar.markdown("BUY: SMA20 > SMA50, RSI < 70, VI+ > VI-")
+st.sidebar.markdown("SELL: SMA20 < SMA50, RSI > 30, VI+ < VI-")
 
 if st.sidebar.button("🔄 Refresh Data"):
     st.rerun()
@@ -114,13 +113,17 @@ indicators = run_query(f"""
     ORDER BY timestamp
 """)
 
-signals = run_query(f"""
+all_signals = run_query(f"""
     SELECT * FROM {GOLD_SIG}
     WHERE ticker = '{selected_ticker}'
     ORDER BY timestamp
 """)
 
 portfolio = run_query(f"SELECT * FROM {GOLD_PORT} ORDER BY ticker")
+
+# Split signals by type
+buy_signals = all_signals[all_signals["signal"] == "BUY"] if not all_signals.empty else pd.DataFrame()
+sell_signals = all_signals[all_signals["signal"] == "SELL"] if not all_signals.empty else pd.DataFrame()
 
 # ── Main Chart ─────────────────────────────────────────────────────────
 if not ohlc.empty:
@@ -155,11 +158,21 @@ if not ohlc.empty:
             mode="lines", name="SMA 50", line=dict(color="#FF9800", width=1.3),
         ), row=1, col=1)
 
-    if not signals.empty:
+    # BUY signals: green triangle-up
+    if not buy_signals.empty:
         fig.add_trace(go.Scatter(
-            x=signals["timestamp"], y=signals["close"],
+            x=buy_signals["timestamp"], y=buy_signals["close"],
             mode="markers", name="BUY Signal",
             marker=dict(symbol="triangle-up", size=14, color="#00E676",
+                        line=dict(width=1.5, color="black")),
+        ), row=1, col=1)
+
+    # SELL signals: red triangle-down
+    if not sell_signals.empty:
+        fig.add_trace(go.Scatter(
+            x=sell_signals["timestamp"], y=sell_signals["close"],
+            mode="markers", name="SELL Signal",
+            marker=dict(symbol="triangle-down", size=14, color="#FF1744",
                         line=dict(width=1.5, color="black")),
         ), row=1, col=1)
 
@@ -193,36 +206,41 @@ else:
     st.warning(f"No OHLC data for {selected_ticker}. Run the ingest pipeline first.")
 
 # ── Signals Table ───────────────────────────────────────────────────────
-st.subheader(f"🚨 Recent BUY Signals — {selected_ticker}")
-if not signals.empty:
+st.subheader(f"🚨 Recent Signals — {selected_ticker}")
+if not all_signals.empty:
+    display_cols = ["timestamp", "signal", "close", "sma20", "sma50", "rsi",
+                    "vortex_positive", "vortex_negative"]
+    display_cols = [c for c in display_cols if c in all_signals.columns]
     st.dataframe(
-        signals.tail(20)[["timestamp", "signal", "close", "sma20", "sma50", "rsi",
-                          "vortex_positive", "vortex_negative"]],
+        all_signals.tail(30)[display_cols],
         use_container_width=True,
     )
 else:
-    st.info("No BUY signals generated for this ticker yet.")
+    st.info("No signals generated for this ticker yet.")
 
 # ── Portfolio Dashboard ────────────────────────────────────────────────
 st.subheader("💼 Portfolio Dashboard")
 if not portfolio.empty:
-    cols = st.columns(len(portfolio))
-    for i, (_, row) in enumerate(portfolio.iterrows()):
-        with cols[i % len(cols)]:
-            pnl = row.get("unrealized_pnl", 0) or 0
-            st.metric(
-                label=row["ticker"],
-                value=f"${row.get('current_price', 0):.2f}",
-                delta=f"PnL: ${pnl:.2f}",
-            )
-            st.caption(
-                f"Holdings: {row.get('holdings', 0)} shares | "
-                f"Avg Entry: ${row.get('avg_entry_price', 0):.2f}"
-            )
+    # Show metrics for active positions (holdings > 0)
+    active = portfolio[portfolio["holdings"] > 0] if "holdings" in portfolio.columns else portfolio
+    if not active.empty:
+        cols = st.columns(min(len(active), 4))
+        for i, (_, row) in enumerate(active.iterrows()):
+            with cols[i % len(cols)]:
+                pnl = row.get("unrealized_pnl", 0) or 0
+                st.metric(
+                    label=row["ticker"],
+                    value=f"${row.get('current_price', 0):.2f}",
+                    delta=f"PnL: ${pnl:.2f}",
+                )
+                st.caption(
+                    f"Holdings: {row.get('holdings', 0)} shares | "
+                    f"Avg Entry: ${row.get('avg_entry_price', 0):.2f}"
+                )
     st.markdown("---")
     st.dataframe(portfolio, use_container_width=True)
 else:
-    st.info("No portfolio data yet. BUY signals will create positions.")
+    st.info("No portfolio data yet. Signals will create positions.")
 
 # ── Footer ──────────────────────────────────────────────────────────────
 st.sidebar.markdown("---")
