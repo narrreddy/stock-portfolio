@@ -40,8 +40,14 @@ DQ_EVENTS = f"{CATALOG}.{SCHEMA}.data_quality_events"
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def run_query(query: str) -> pd.DataFrame:
+def run_query(query: str, critical: bool = True) -> pd.DataFrame:
     """Execute SQL via Databricks REST API and return a typed DataFrame.
+    
+    Args:
+        query: SQL statement to execute.
+        critical: If True (default), display error and stop the app on failure.
+                  If False, return an empty DataFrame on failure (for optional tables
+                  like trade_log, data_quality_events that may not exist yet).
     
     Cached for 60 seconds to avoid hammering the warehouse on rapid refreshes.
     """
@@ -52,6 +58,8 @@ def run_query(query: str) -> pd.DataFrame:
             wait_timeout="50s",
         )
     except Exception as e:
+        if not critical:
+            return pd.DataFrame()
         st.error(
             f"**Query execution error**\n\n"
             f"- `warehouse_id`: `{WAREHOUSE_ID}`\n"
@@ -66,6 +74,8 @@ def run_query(query: str) -> pd.DataFrame:
         response = w.statement_execution.get_statement(response.statement_id)
 
     if response.status.state != StatementState.SUCCEEDED:
+        if not critical:
+            return pd.DataFrame()
         msg = response.status.error.message if response.status.error else "unknown"
         st.error(f"**Query failed** ({response.status.state}): {msg}")
         st.stop()
@@ -97,6 +107,11 @@ st.title("Live Stock Signal Dashboard")
 # ── Sidebar ───────────────────────────────────────────────────────────
 tickers_df = run_query(f"SELECT DISTINCT ticker FROM {BRONZE} ORDER BY ticker")
 available_tickers = tickers_df["ticker"].tolist() if not tickers_df.empty else []
+
+if not available_tickers:
+    st.warning("No data available yet. Run the pipeline notebook first to ingest market data.")
+    st.stop()
+
 selected_ticker = st.sidebar.selectbox("Select Ticker", available_tickers, index=0)
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Signal Criteria**")
@@ -112,28 +127,25 @@ if st.sidebar.button("Refresh Data"):
     st.cache_data.clear()
     st.rerun()
 
-# ── Data Quality Events in Sidebar ─────────────────────────────────────
+# ── Data Quality Events in Sidebar (non-critical) ────────────────────
 with st.sidebar.expander("Data Quality Events", expanded=False):
-    try:
-        dq_df = run_query(f"""
-            SELECT event_type, ticker, message, detected_at
-            FROM {DQ_EVENTS}
-            ORDER BY detected_at DESC
-            LIMIT 15
-        """)
-        if not dq_df.empty:
-            for _, row in dq_df.iterrows():
-                icon = {
-                    "API_ERROR": "X", "MISSING_BARS": "!",
-                    "DUPLICATE_DETECTED": "D", "STALE_DATA": "S",
-                    "GAP_DETECTED": "G", "INVALID_PRICE": "P",
-                    "EXTREME_SPIKE_REMOVED": "!",
-                }.get(row.get("event_type", ""), "?")
-                st.caption(f"[{icon}] {row.get('ticker', '')} — {row.get('message', '')}")
-        else:
-            st.caption("No data quality events recorded.")
-    except Exception:
-        st.caption("DQ events table not available yet.")
+    dq_df = run_query(f"""
+        SELECT event_type, ticker, message, detected_at
+        FROM {DQ_EVENTS}
+        ORDER BY detected_at DESC
+        LIMIT 15
+    """, critical=False)
+    if not dq_df.empty:
+        for _, row in dq_df.iterrows():
+            icon = {
+                "API_ERROR": "X", "MISSING_BARS": "!",
+                "DUPLICATE_DETECTED": "D", "STALE_DATA": "S",
+                "GAP_DETECTED": "G", "INVALID_PRICE": "P",
+                "EXTREME_SPIKE_REMOVED": "!",
+            }.get(row.get("event_type", ""), "?")
+            st.caption(f"[{icon}] {row.get('ticker', '')} — {row.get('message', '')}")
+    else:
+        st.caption("No data quality events recorded yet.")
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Powered by Databricks | Delta Lake | Spark Streaming")
@@ -149,23 +161,22 @@ indicators = run_query(f"""
     SELECT * FROM {SILVER}
     WHERE ticker = '{selected_ticker}' AND rsi IS NOT NULL
     ORDER BY timestamp
-""")
+""", critical=False)
 
 all_signals = run_query(f"""
     SELECT * FROM {GOLD_SIG}
     WHERE ticker = '{selected_ticker}'
     ORDER BY timestamp
-""")
+""", critical=False)
 
-portfolio = run_query(f"SELECT * FROM {GOLD_PORT} ORDER BY ticker")
+portfolio = run_query(f"SELECT * FROM {GOLD_PORT} ORDER BY ticker", critical=False)
 
 # Split signals by type
 buy_signals = all_signals[all_signals["signal"] == "BUY"] if not all_signals.empty else pd.DataFrame()
 sell_signals = all_signals[all_signals["signal"] == "SELL"] if not all_signals.empty else pd.DataFrame()
 
-# ── Performance Metrics Bar ────────────────────────────────────────────
-try:
-    perf = run_query(f"""
+# ── Performance Metrics Bar (non-critical) ───────────────────────────
+perf = run_query(f"""
     SELECT
       COUNT(*)                                             AS total_trades,
       SUM(CASE WHEN signal = 'BUY' THEN 1 ELSE 0 END)     AS buy_count,
@@ -177,20 +188,19 @@ try:
       ROUND(SUM(CASE WHEN pnl_realized > 0 THEN 1 ELSE 0 END) * 100.0 /
             NULLIF(SUM(CASE WHEN pnl_realized != 0 THEN 1 ELSE 0 END), 0), 1) AS win_rate
     FROM {TRADE_LOG}
-    """)
-    if not perf.empty and perf["total_trades"].iloc[0] and perf["total_trades"].iloc[0] > 0:
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Total Trades", int(perf["total_trades"].iloc[0]))
-        m2.metric("Realized PnL", f"${perf['total_pnl'].iloc[0]:.2f}")
-        win_rate = perf["win_rate"].iloc[0]
-        m3.metric("Win Rate", f"{win_rate:.1f}%" if pd.notna(win_rate) else "N/A")
-        avg_w = perf["avg_win"].iloc[0]
-        m4.metric("Avg Win", f"${avg_w:.2f}" if pd.notna(avg_w) else "N/A")
-        avg_l = perf["avg_loss"].iloc[0]
-        m5.metric("Avg Loss", f"${avg_l:.2f}" if pd.notna(avg_l) else "N/A")
-        st.markdown("---")
-except Exception:
-    pass  # Trade log may not exist yet
+""", critical=False)
+
+if not perf.empty and perf["total_trades"].iloc[0] and perf["total_trades"].iloc[0] > 0:
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Total Trades", int(perf["total_trades"].iloc[0]))
+    m2.metric("Realized PnL", f"${perf['total_pnl'].iloc[0]:.2f}")
+    win_rate = perf["win_rate"].iloc[0]
+    m3.metric("Win Rate", f"{win_rate:.1f}%" if pd.notna(win_rate) else "N/A")
+    avg_w = perf["avg_win"].iloc[0]
+    m4.metric("Avg Win", f"${avg_w:.2f}" if pd.notna(avg_w) else "N/A")
+    avg_l = perf["avg_loss"].iloc[0]
+    m5.metric("Avg Loss", f"${avg_l:.2f}" if pd.notna(avg_l) else "N/A")
+    st.markdown("---")
 
 # ── Main Chart ─────────────────────────────────────────────────────────
 if not ohlc.empty:
@@ -312,53 +322,47 @@ with tab1:
 
 with tab2:
     st.subheader("Trade Log (All Tickers)")
-    try:
-        trades = run_query(f"""
-            SELECT trade_id, ticker, signal, signal_score, price, quantity,
-                   pnl_realized, stop_loss, take_profit, timestamp
-            FROM {TRADE_LOG}
-            ORDER BY timestamp DESC
-            LIMIT 50
-        """)
-        if not trades.empty:
-            st.dataframe(trades, use_container_width=True)
-        else:
-            st.info("No trades recorded yet.")
-    except Exception:
-        st.info("Trade log table not available yet. Run the pipeline first.")
+    trades = run_query(f"""
+        SELECT trade_id, ticker, signal, signal_score, price, quantity,
+               pnl_realized, stop_loss, take_profit, timestamp
+        FROM {TRADE_LOG}
+        ORDER BY timestamp DESC
+        LIMIT 50
+    """, critical=False)
+    if not trades.empty:
+        st.dataframe(trades, use_container_width=True)
+    else:
+        st.info("No trades recorded yet. Run the pipeline to generate signals.")
 
 with tab3:
     st.subheader("Cumulative Realized PnL")
-    try:
-        equity = run_query(f"""
-            SELECT timestamp,
-                   pnl_realized,
-                   SUM(COALESCE(pnl_realized, 0)) OVER (ORDER BY timestamp) AS cumulative_pnl
-            FROM {TRADE_LOG}
-            WHERE pnl_realized IS NOT NULL AND pnl_realized != 0
-            ORDER BY timestamp
-        """)
-        if not equity.empty and len(equity) > 1:
-            eq_fig = go.Figure()
-            eq_fig.add_trace(go.Scatter(
-                x=equity["timestamp"], y=equity["cumulative_pnl"],
-                mode="lines+markers", name="Cumulative PnL",
-                line=dict(color="#00E5FF", width=2),
-                fill="tozeroy",
-                fillcolor="rgba(0, 229, 255, 0.1)",
-            ))
-            eq_fig.add_hline(y=0, line_dash="dash", line_color="gray")
-            eq_fig.update_layout(
-                height=400, template="plotly_dark",
-                yaxis_title="Cumulative PnL ($)",
-                xaxis_title="Time",
-                margin=dict(l=40, r=20, t=20, b=40),
-            )
-            st.plotly_chart(eq_fig, use_container_width=True)
-        else:
-            st.info("Not enough closed trades to plot equity curve yet.")
-    except Exception:
-        st.info("Trade log table not available yet.")
+    equity = run_query(f"""
+        SELECT timestamp,
+               pnl_realized,
+               SUM(COALESCE(pnl_realized, 0)) OVER (ORDER BY timestamp) AS cumulative_pnl
+        FROM {TRADE_LOG}
+        WHERE pnl_realized IS NOT NULL AND pnl_realized != 0
+        ORDER BY timestamp
+    """, critical=False)
+    if not equity.empty and len(equity) > 1:
+        eq_fig = go.Figure()
+        eq_fig.add_trace(go.Scatter(
+            x=equity["timestamp"], y=equity["cumulative_pnl"],
+            mode="lines+markers", name="Cumulative PnL",
+            line=dict(color="#00E5FF", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(0, 229, 255, 0.1)",
+        ))
+        eq_fig.add_hline(y=0, line_dash="dash", line_color="gray")
+        eq_fig.update_layout(
+            height=400, template="plotly_dark",
+            yaxis_title="Cumulative PnL ($)",
+            xaxis_title="Time",
+            margin=dict(l=40, r=20, t=20, b=40),
+        )
+        st.plotly_chart(eq_fig, use_container_width=True)
+    else:
+        st.info("Not enough closed trades to plot equity curve yet.")
 
 # ── Portfolio Dashboard ────────────────────────────────────────────────
 st.subheader("Portfolio Dashboard")

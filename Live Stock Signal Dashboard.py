@@ -12,6 +12,25 @@ display(spark.sql("SHOW CATALOGS"))
 
 # COMMAND ----------
 
+# DBTITLE 1,Create Missing Audit Tables (SQL)
+# MAGIC %sql
+# MAGIC -- Add enhanced columns to existing tables (idempotent check)
+# MAGIC -- This cell can be re-run safely.
+# MAGIC
+# MAGIC SELECT 'trade_log' AS tbl, COUNT(*) AS rows FROM stockapp.production.trade_log
+# MAGIC UNION ALL
+# MAGIC SELECT 'data_quality_events', COUNT(*) FROM stockapp.production.data_quality_events
+# MAGIC UNION ALL
+# MAGIC SELECT 'trade_signals', COUNT(*) FROM stockapp.production.trade_signals
+# MAGIC UNION ALL
+# MAGIC SELECT 'portfolio_state', COUNT(*) FROM stockapp.production.portfolio_state
+# MAGIC UNION ALL
+# MAGIC SELECT 'raw_market_data', COUNT(*) FROM stockapp.production.raw_market_data
+# MAGIC UNION ALL
+# MAGIC SELECT 'technical_indicators', COUNT(*) FROM stockapp.production.technical_indicators
+
+# COMMAND ----------
+
 # DBTITLE 1,Create Unity Catalog, Schema, and Delta Tables
 # MAGIC %pip install yfinance numpy --quiet
 
